@@ -1,0 +1,30 @@
+{
+  "name": "api-manager-express-axam",
+  "version": "1.0.0",
+  "description": "API REST intermedia (Middleware) para interactuar con el ERP Manager+",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test:shopify": "node shopifyAuth.js",
+    "sync:stocks": "node syncStocks.js",
+    "sync:all": "node syncStocks.js --all",
+    "sync:dry-run": "node syncStocks.js --all --dry-run",
+    "products:with-stock": "node getProductsWithStock.js"
+  },
+  "keywords": [
+    "express",
+    "api",
+    "middleware",
+    "erp"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5"
+  }
+}
+
