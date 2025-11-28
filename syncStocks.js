@@ -20,6 +20,12 @@ const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 let erpAuthToken = null;
 let erpTokenExpirationTime = null;
 
+// Caché para productos de Shopify (Mapa SKU -> datos del producto)
+let shopifyProductsCache = null;
+
+// Caché para locationId de Shopify
+let shopifyLocationIdCache = null;
+
 /**
  * Autenticarse con el ERP Manager+
  */
@@ -135,35 +141,152 @@ async function getManagerProductBySKU(sku) {
         if (error.response?.status === 404) {
             return null; // Producto no encontrado
         }
+        
+        // Detectar rate limiting
+        if (error.response?.status === 429) {
+            throw new Error(`Rate limit alcanzado en Manager+ (429). Reduce la concurrencia.`);
+        }
+        
+        // Detectar errores de servidor (puede ser sobrecarga)
+        if (error.response?.status >= 500) {
+            throw new Error(`Error del servidor Manager+ (${error.response.status}). Puede estar sobrecargado.`);
+        }
+        
         console.error(`   ❌ Error al obtener stock de ${sku} de Manager+: ${error.response?.data?.message || error.message}`);
         throw error;
     }
 }
 
 /**
- * Obtener información de un producto desde Shopify por SKU
+ * Pre-cargar todos los productos de Shopify en un Map para acceso rápido O(1)
  * 
- * @param {string} sku - Código SKU del producto
- * @returns {Promise<Object>} Información del producto con stock
+ * @returns {Promise<Map<string, Object>>} Mapa de SKU -> datos del producto
  */
-async function getShopifyProductStockBySKU(sku) {
+async function loadAllShopifyProducts() {
+    if (shopifyProductsCache) {
+        return shopifyProductsCache;
+    }
+
     try {
-        const result = await getShopifyProductBySKU(sku);
+        console.log('📦 Pre-cargando productos de Shopify en memoria...');
+        const productMap = new Map();
         
-        if (!result || !result.variant) {
-            return null;
+        let hasMore = true;
+        let nextUrl = null;
+
+        while (hasMore) {
+            let url = `${SHOPIFY_BASE_URL}/products.json`;
+            
+            if (nextUrl) {
+                url = nextUrl;
+            } else {
+                // Primera petición - incluir parámetros
+                url += '?limit=250&fields=id,title,variants';
+            }
+
+            const response = await axios.get(url, {
+                headers: {
+                    'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            const products = response.data.products;
+            
+            if (!products || products.length === 0) {
+                hasMore = false;
+                break;
+            }
+            
+            // Procesar cada producto y sus variantes
+            // Nota: Cada variante con SKU se cuenta como un item sincronizable
+            // porque cada variante tiene su propio stock independiente
+            products.forEach(product => {
+                product.variants.forEach(variant => {
+                    if (variant.sku) {
+                        // Si el SKU ya existe, mantener el primero (puede haber duplicados)
+                        if (!productMap.has(variant.sku)) {
+                            productMap.set(variant.sku, {
+                                sku: variant.sku,
+                                productId: product.id,
+                                variantId: variant.id,
+                                inventoryItemId: variant.inventory_item_id,
+                                currentStock: variant.inventory_quantity !== null ? variant.inventory_quantity : 0,
+                                productTitle: product.title
+                            });
+                        }
+                    }
+                });
+            });
+            
+            // Si recibimos menos productos que el límite, no hay más páginas
+            if (products.length < 250) {
+                hasMore = false;
+                break;
+            }
+            
+            // Verificar si hay más páginas usando el header Link
+            const linkHeader = response.headers.link;
+            if (linkHeader && typeof linkHeader === 'string') {
+                // Buscar el link "next"
+                const links = linkHeader.split(',').map(link => link.trim());
+                const nextLink = links.find(link => link.includes('rel="next"'));
+                
+                if (nextLink) {
+                    // Extraer la URL del link (entre < y >)
+                    const urlMatch = nextLink.match(/<([^>]+)>/);
+                    if (urlMatch) {
+                        nextUrl = urlMatch[1];
+                        hasMore = true;
+                    } else {
+                        hasMore = false;
+                    }
+                } else {
+                    hasMore = false;
+                }
+            } else {
+                hasMore = false;
+            }
         }
 
-        const variant = result.variant;
+        shopifyProductsCache = productMap;
         
-        return {
-            sku: variant.sku,
-            productId: result.product.id,
-            variantId: variant.id,
-            inventoryItemId: variant.inventory_item_id,
-            currentStock: variant.inventory_quantity !== null ? variant.inventory_quantity : 0,
-            productTitle: result.product.title
-        };
+        // Contar productos reales vs variantes para estadísticas
+        const totalProducts = Array.from(productMap.values())
+            .reduce((acc, item) => {
+                if (!acc.has(item.productId)) {
+                    acc.set(item.productId, item.productTitle);
+                }
+                return acc;
+            }, new Map()).size;
+        
+        console.log(`✅ ${productMap.size} SKUs únicos (variantes) cargados en memoria`);
+        console.log(`   📦 Productos: ${totalProducts} | 🏷️  Variantes con SKU: ${productMap.size}`);
+        
+        return productMap;
+        
+    } catch (error) {
+        console.error('❌ Error al pre-cargar productos de Shopify:', error.message);
+        throw error;
+    }
+}
+
+/**
+ * Obtener información de un producto desde Shopify por SKU (usando caché)
+ * 
+ * @param {string} sku - Código SKU del producto
+ * @param {Map} productsMap - Mapa de productos (opcional, se carga automáticamente)
+ * @returns {Promise<Object>} Información del producto con stock
+ */
+async function getShopifyProductStockBySKU(sku, productsMap = null) {
+    try {
+        // Si no se proporciona el mapa, cargarlo
+        if (!productsMap) {
+            productsMap = await loadAllShopifyProducts();
+        }
+
+        const product = productsMap.get(sku);
+        return product || null;
         
     } catch (error) {
         console.error(`❌ Error al obtener producto ${sku} de Shopify:`, error.message);
@@ -172,11 +295,16 @@ async function getShopifyProductStockBySKU(sku) {
 }
 
 /**
- * Obtener el location_id de inventario de Shopify
+ * Obtener el location_id de inventario de Shopify (con caché)
  * 
  * @returns {Promise<number>} ID de la ubicación de inventario
  */
 async function getShopifyLocationId() {
+    // Retornar caché si existe
+    if (shopifyLocationIdCache) {
+        return shopifyLocationIdCache;
+    }
+
     try {
         const response = await axios.get(`${SHOPIFY_BASE_URL}/locations.json`, {
             headers: {
@@ -191,7 +319,8 @@ async function getShopifyLocationId() {
         }
 
         // Retornar la primera ubicación (puedes ajustar la lógica según necesites)
-        return locations[0].id;
+        shopifyLocationIdCache = locations[0].id;
+        return shopifyLocationIdCache;
         
     } catch (error) {
         if (error.response?.status === 403) {
@@ -233,30 +362,43 @@ async function updateShopifyStock(inventoryItemId, locationId, quantity) {
         return response.data;
         
     } catch (error) {
+        // Detectar rate limiting de Shopify
+        if (error.response?.status === 429) {
+            const retryAfter = error.response.headers['retry-after'];
+            const message = retryAfter 
+                ? `Rate limit de Shopify alcanzado. Espera ${retryAfter} segundos antes de continuar.`
+                : `Rate limit de Shopify alcanzado (429). Reduce la concurrencia o espera un momento.`;
+            throw new Error(message);
+        }
+        
+        // Detectar errores de servidor
+        if (error.response?.status >= 500) {
+            throw new Error(`Error del servidor Shopify (${error.response.status}). Puede estar sobrecargado.`);
+        }
+        
         console.error('❌ Error al actualizar stock en Shopify:', error.response?.data || error.message);
         throw error;
     }
 }
 
 /**
- * Sincronizar el stock de un producto específico
+ * Sincronizar el stock de un producto específico (optimizado con caché)
  * 
  * @param {string} sku - Código SKU del producto
  * @param {Object} options - Opciones de sincronización
+ * @param {Map} shopifyProductsMap - Mapa de productos de Shopify (opcional)
+ * @param {number} locationId - ID de ubicación (opcional, se obtiene si no se proporciona)
  * @returns {Promise<Object>} Resultado de la sincronización
  */
-async function syncProductStock(sku, options = {}) {
+async function syncProductStock(sku, options = {}, shopifyProductsMap = null, locationId = null) {
     const { dryRun = false, forceUpdate = false } = options;
     
     try {
-        console.log(`\n🔄 ${sku}`);
-        
         // 1. Obtener stock de Manager+
         let managerProduct;
         try {
             managerProduct = await getManagerProductBySKU(sku);
         } catch (error) {
-            console.error(`   ❌ Error Manager+: ${error.message}`);
             return {
                 sku,
                 success: false,
@@ -273,11 +415,9 @@ async function syncProductStock(sku, options = {}) {
                 action: 'skipped'
             };
         }
-
-        console.log(`   📦 Manager+: ${managerProduct.stock} ${managerProduct.unidad || ''}`);
         
-        // 2. Obtener stock de Shopify
-        const shopifyProduct = await getShopifyProductStockBySKU(sku);
+        // 2. Obtener stock de Shopify (usando caché si está disponible)
+        const shopifyProduct = await getShopifyProductStockBySKU(sku, shopifyProductsMap);
         
         if (!shopifyProduct) {
             return {
@@ -287,15 +427,12 @@ async function syncProductStock(sku, options = {}) {
                 action: 'skipped'
             };
         }
-
-        console.log(`   🛒 Shopify: ${shopifyProduct.currentStock}`);
         
         // 3. Comparar stocks
         const managerStock = parseInt(managerProduct.stock) || 0;
         const shopifyStock = shopifyProduct.currentStock;
         
         if (managerStock === shopifyStock && !forceUpdate) {
-            console.log(`   ✓ Sincronizado (${managerStock})`);
             return {
                 sku,
                 success: true,
@@ -308,7 +445,6 @@ async function syncProductStock(sku, options = {}) {
         
         // 4. Actualizar stock en Shopify
         if (dryRun) {
-            console.log(`   🔍 [SIMULACIÓN] Actualizaría: ${shopifyStock} → ${managerStock}`);
             return {
                 sku,
                 success: true,
@@ -320,16 +456,16 @@ async function syncProductStock(sku, options = {}) {
             };
         }
         
-        console.log(`   📤 Actualizando: ${shopifyStock} → ${managerStock}`);
+        // Obtener locationId si no se proporciona
+        if (!locationId) {
+            locationId = await getShopifyLocationId();
+        }
         
-        const locationId = await getShopifyLocationId();
         await updateShopifyStock(
             shopifyProduct.inventoryItemId,
             locationId,
             managerStock
         );
-        
-        console.log(`   ✅ Actualizado`);
         
         return {
             sku,
@@ -342,7 +478,6 @@ async function syncProductStock(sku, options = {}) {
         };
         
     } catch (error) {
-        console.error(`   ❌ Error: ${error.message}`);
         return {
             sku,
             success: false,
@@ -353,7 +488,60 @@ async function syncProductStock(sku, options = {}) {
 }
 
 /**
- * Sincronizar stocks de múltiples productos
+ * Procesar un array en chunks con límite de concurrencia
+ * 
+ * @param {Array} array - Array a procesar
+ * @param {Function} processor - Función que procesa cada elemento
+ * @param {number} concurrency - Número máximo de operaciones paralelas
+ * @returns {Promise<Array>} Resultados del procesamiento
+ */
+async function processInParallel(array, processor, concurrency = 5) {
+    const results = [];
+    let rateLimitErrors = 0;
+    const MAX_RATE_LIMIT_ERRORS = 5; // Máximo de errores de rate limit antes de reducir concurrencia
+    
+    for (let i = 0; i < array.length; i += concurrency) {
+        const chunk = array.slice(i, i + concurrency);
+        
+        try {
+            const chunkResults = await Promise.all(chunk.map(processor));
+            results.push(...chunkResults);
+            
+            // Contar errores de rate limiting en este chunk
+            const chunkRateLimitErrors = chunkResults.filter(r => 
+                r.error && (r.error.includes('Rate limit') || r.error.includes('429'))
+            ).length;
+            
+            rateLimitErrors += chunkRateLimitErrors;
+            
+            // Si hay muchos errores de rate limiting, advertir
+            if (rateLimitErrors >= MAX_RATE_LIMIT_ERRORS) {
+                console.warn(`\n⚠️  Se detectaron múltiples errores de rate limiting.`);
+                console.warn(`   Considera reducir la concurrencia con --concurrency=${Math.max(1, Math.floor(concurrency / 2))}\n`);
+            }
+            
+        } catch (error) {
+            // Si es un error de rate limit global, esperar un poco y continuar
+            if (error.message && error.message.includes('Rate limit')) {
+                console.warn(`\n⚠️  Rate limit detectado. Esperando 2 segundos antes de continuar...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                // Continuar con el siguiente chunk (los errores individuales ya están en los resultados)
+            } else {
+                throw error;
+            }
+        }
+        
+        // Mostrar progreso
+        const processed = Math.min(i + concurrency, array.length);
+        process.stdout.write(`\r   Procesando: ${processed}/${array.length} productos... \n`);
+    }
+    
+    process.stdout.write('\n');
+    return results;
+}
+
+/**
+ * Sincronizar stocks de múltiples productos (optimizado con procesamiento paralelo)
  * 
  * @param {Array<string>} skus - Array de códigos SKU
  * @param {Object} options - Opciones de sincronización
@@ -369,78 +557,240 @@ async function syncMultipleProducts(skus, options = {}) {
         details: []
     };
     
-    console.log(`\n🚀 Iniciando sincronización de ${skus.length} productos\n`);
-    console.log('='.repeat(60));
+    // Validar y limitar concurrencia
+    let concurrency = options.concurrency || 5;
+    const MAX_RECOMMENDED_CONCURRENCY = 20;
+    const ABSOLUTE_MAX_CONCURRENCY = 50;
     
-    // Verificar autenticación con Shopify primero
-    await verifyShopifyAuth();
-    
-    for (const sku of skus) {
-        const result = await syncProductStock(sku, options);
-        results.details.push(result);
-        
-        if (result.success) {
-            if (result.action === 'updated' || result.action === 'would_update') {
-                results.updated++;
-            } else if (result.action === 'no_change') {
-                results.noChange++;
-            } else {
-                results.skipped++;
-            }
-        } else {
-            results.errors++;
-        }
-        
-        // Pequeña pausa para no sobrecargar las APIs
-        await new Promise(resolve => setTimeout(resolve, 500));
+    if (concurrency > ABSOLUTE_MAX_CONCURRENCY) {
+        console.warn(`⚠️  Advertencia: Concurrencia de ${concurrency} es muy alta. Limitando a ${ABSOLUTE_MAX_CONCURRENCY}`);
+        concurrency = ABSOLUTE_MAX_CONCURRENCY;
+    } else if (concurrency > MAX_RECOMMENDED_CONCURRENCY) {
+        console.warn(`⚠️  Advertencia: Concurrencia de ${concurrency} es alta. Puede causar rate limiting.`);
+        console.warn(`   Recomendado: 5-10 para evitar problemas con las APIs.\n`);
     }
     
-    console.log('\n' + '='.repeat(60));
-    console.log('📊 Resumen de sincronización:');
-    console.log(`   ✅ Actualizados: ${results.updated}`);
-    console.log(`   ℹ️  Sin cambios: ${results.noChange}`);
-    console.log(`   ⏭️  Omitidos: ${results.skipped}`);
-    console.log(`   ❌ Errores: ${results.errors}`);
+    console.log(`\n🚀 Iniciando sincronización optimizada de ${skus.length} SKUs`);
+    console.log(`⚡ Concurrencia: ${concurrency} SKUs en paralelo\n`);
     console.log('='.repeat(60));
     
-    return results;
+    const startTime = Date.now();
+    
+    try {
+        // Verificar autenticación con Shopify primero
+        await verifyShopifyAuth();
+        
+        // Pre-cargar productos de Shopify en memoria (una sola vez)
+        console.log('📦 Pre-cargando datos...');
+        const shopifyProductsMap = await loadAllShopifyProducts();
+        
+        // Obtener locationId una sola vez (si no es dry-run)
+        let locationId = null;
+        if (!options.dryRun) {
+            locationId = await getShopifyLocationId();
+        }
+        
+        console.log('\n🔄 Iniciando sincronización paralela...\n');
+        
+        // Procesar productos en paralelo con límite de concurrencia
+        const processedResults = await processInParallel(
+            skus,
+            async (sku) => {
+                try {
+                    const result = await syncProductStock(sku, options, shopifyProductsMap, locationId);
+                    
+                    // Mostrar resultado solo si hay algo relevante
+                    if (result.action === 'updated' || result.action === 'would_update') {
+                        console.log(`   ✅ ${sku}: ${result.shopifyStock} → ${result.managerStock}`);
+                    } else if (result.action === 'error') {
+                        console.log(`   ❌ ${sku}: ${result.error}`);
+                    }
+                    
+                    return result;
+                } catch (error) {
+                    return {
+                        sku,
+                        success: false,
+                        error: error.message,
+                        action: 'error'
+                    };
+                }
+            },
+            concurrency
+        );
+        
+        results.details = processedResults;
+        
+        // Procesar resultados
+        results.details.forEach(result => {
+            if (result.success) {
+                if (result.action === 'updated' || result.action === 'would_update') {
+                    results.updated++;
+                } else if (result.action === 'no_change') {
+                    results.noChange++;
+                } else {
+                    results.skipped++;
+                }
+            } else {
+                results.errors++;
+            }
+        });
+        
+        // ========== REINTENTOS AUTOMÁTICOS ==========
+        // Identificar productos que fallaron por errores recuperables
+        const failedProducts = results.details.filter(r => 
+            !r.success && 
+            r.action === 'error' &&
+            // Solo reintentar errores recuperables (no productos no encontrados)
+            r.error && 
+            !r.error.includes('no encontrado') &&
+            !r.error.includes('skipped')
+        );
+        
+        if (failedProducts.length > 0 && !options.dryRun) {
+            const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 3;
+            const retryDelay = options.retryDelay !== undefined ? options.retryDelay : 2000; // 2 segundos
+            
+            console.log(`\n🔄 Reintentando ${failedProducts.length} productos que fallaron...`);
+            console.log(`   Intentos máximos: ${maxRetries}`);
+            console.log(`   Retraso entre intentos: ${retryDelay}ms\n`);
+            
+            // Esperar un poco antes de reintentar (para que las APIs se recuperen)
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+            
+            let retryAttempt = 1;
+            let remainingFailures = [...failedProducts];
+            const retryResults = [];
+            
+            while (remainingFailures.length > 0 && retryAttempt <= maxRetries) {
+                console.log(`\n🔄 Intento ${retryAttempt}/${maxRetries} de reintento...`);
+                
+                // Reintentar con menor concurrencia para evitar más rate limits
+                const retryConcurrency = Math.max(2, Math.floor(concurrency / 2));
+                const failedSkus = remainingFailures.map(r => r.sku);
+                
+                const retryProcessedResults = await processInParallel(
+                    failedSkus,
+                    async (sku) => {
+                        try {
+                            const result = await syncProductStock(sku, options, shopifyProductsMap, locationId);
+                            
+                            if (result.success) {
+                                console.log(`   ✅ Reintento exitoso: ${sku}`);
+                            }
+                            
+                            return result;
+                        } catch (error) {
+                            return {
+                                sku,
+                                success: false,
+                                error: error.message,
+                                action: 'error'
+                            };
+                        }
+                    },
+                    retryConcurrency
+                );
+                
+                retryResults.push(...retryProcessedResults);
+                
+                // Actualizar resultados originales y contadores
+                retryProcessedResults.forEach(retryResult => {
+                    const originalIndex = results.details.findIndex(r => r.sku === retryResult.sku);
+                    if (originalIndex !== -1) {
+                        const originalResult = results.details[originalIndex];
+                        const wasError = !originalResult.success && originalResult.action === 'error';
+                        
+                        // Actualizar el resultado
+                        results.details[originalIndex] = retryResult;
+                        
+                        if (retryResult.success && wasError) {
+                            // Cambiar de error a éxito - actualizar contadores
+                            results.errors--;
+                            if (retryResult.action === 'updated' || retryResult.action === 'would_update') {
+                                results.updated++;
+                            } else if (retryResult.action === 'no_change') {
+                                results.noChange++;
+                            } else if (retryResult.action === 'skipped') {
+                                results.skipped++;
+                            }
+                        }
+                        // Si sigue fallando, el error ya está contado, no hacer nada
+                    }
+                });
+                
+                // Identificar qué productos todavía fallaron
+                remainingFailures = retryProcessedResults.filter(r => 
+                    !r.success && 
+                    r.action === 'error' &&
+                    r.error && 
+                    !r.error.includes('no encontrado') &&
+                    !r.error.includes('skipped')
+                );
+                
+                if (remainingFailures.length > 0 && retryAttempt < maxRetries) {
+                    console.log(`   ⚠️  ${remainingFailures.length} productos aún fallan. Esperando ${retryDelay}ms antes del próximo intento...`);
+                    await new Promise(resolve => setTimeout(resolve, retryDelay));
+                }
+                
+                retryAttempt++;
+            }
+            
+            if (remainingFailures.length > 0) {
+                console.log(`\n⚠️  Después de ${maxRetries} intentos, ${remainingFailures.length} productos aún fallan:`);
+                remainingFailures.forEach(failure => {
+                    console.log(`   ❌ ${failure.sku}: ${failure.error}`);
+                });
+            } else {
+                console.log(`\n✅ Todos los productos fallidos fueron actualizados exitosamente después de los reintentos.`);
+            }
+        }
+        
+        const endTime = Date.now();
+        const duration = ((endTime - startTime) / 1000).toFixed(2);
+        
+        console.log('\n' + '='.repeat(60));
+        console.log('📊 Resumen final de sincronización:');
+        console.log(`   ✅ Actualizados: ${results.updated}`);
+        console.log(`   ℹ️  Sin cambios: ${results.noChange}`);
+        console.log(`   ⏭️  Omitidos: ${results.skipped}`);
+        console.log(`   ❌ Errores finales: ${results.errors}`);
+        console.log(`   ⏱️  Tiempo total: ${duration}s`);
+        console.log(`   ⚡ Velocidad: ${(results.total / duration).toFixed(2)} productos/segundo`);
+        console.log('='.repeat(60));
+        
+        return results;
+        
+    } catch (error) {
+        console.error('\n❌ Error fatal en sincronización:', error.message);
+        throw error;
+    }
 }
 
 /**
- * Obtener todos los SKUs de productos de Shopify y sincronizarlos
+ * Obtener todos los SKUs de productos de Shopify y sincronizarlos (optimizado)
  * 
  * @param {Object} options - Opciones de sincronización
  * @returns {Promise<Object>} Resumen de la sincronización
  */
 async function syncAllProducts(options = {}) {
     try {
-        console.log('📦 Obteniendo lista de productos de Shopify...');
+        // Pre-cargar productos de Shopify (esto también extrae los SKUs)
+        const shopifyProductsMap = await loadAllShopifyProducts();
         
-        // Obtener productos de Shopify
-        const response = await axios.get(`${SHOPIFY_BASE_URL}/products.json`, {
-            headers: {
-                'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
-                'Content-Type': 'application/json'
-            },
-            params: {
-                limit: 250, // Máximo permitido por Shopify
-                fields: 'id,title,variants'
-            }
-        });
-
-        const products = response.data.products;
-        const skus = [];
+        // Extraer SKUs del mapa
+        const skus = Array.from(shopifyProductsMap.keys());
         
-        // Extraer todos los SKUs únicos
-        products.forEach(product => {
-            product.variants.forEach(variant => {
-                if (variant.sku && !skus.includes(variant.sku)) {
-                    skus.push(variant.sku);
+        // Contar productos reales para estadísticas
+        const totalProducts = Array.from(shopifyProductsMap.values())
+            .reduce((acc, item) => {
+                if (!acc.has(item.productId)) {
+                    acc.set(item.productId, true);
                 }
-            });
-        });
+                return acc;
+            }, new Map()).size;
         
-        console.log(`✅ Se encontraron ${skus.length} productos únicos con SKU`);
+        console.log(`✅ Sincronizando ${skus.length} SKUs únicos (de ${totalProducts} productos)\n`);
         
         return await syncMultipleProducts(skus, options);
         
@@ -463,26 +813,108 @@ module.exports = {
 if (require.main === module) {
     const args = process.argv.slice(2);
     
+    // Extraer opciones
     const options = {
         dryRun: args.includes('--dry-run'),
         force: args.includes('--force'),
         all: args.includes('--all')
     };
     
+    // Extraer concurrencia si se especifica (--concurrency=10)
+    const concurrencyArg = args.find(arg => arg.startsWith('--concurrency='));
+    if (concurrencyArg) {
+        const concurrencyValue = parseInt(concurrencyArg.split('=')[1]);
+        if (!isNaN(concurrencyValue) && concurrencyValue > 0) {
+            options.concurrency = concurrencyValue;
+        }
+    }
+    
+    // Extraer maxRetries si se especifica (--max-retries=3)
+    const maxRetriesArg = args.find(arg => arg.startsWith('--max-retries='));
+    if (maxRetriesArg) {
+        const maxRetriesValue = parseInt(maxRetriesArg.split('=')[1]);
+        if (!isNaN(maxRetriesValue) && maxRetriesValue >= 0) {
+            options.maxRetries = maxRetriesValue;
+        }
+    }
+    
+    // Extraer retryDelay si se especifica (--retry-delay=2000)
+    const retryDelayArg = args.find(arg => arg.startsWith('--retry-delay='));
+    if (retryDelayArg) {
+        const retryDelayValue = parseInt(retryDelayArg.split('=')[1]);
+        if (!isNaN(retryDelayValue) && retryDelayValue > 0) {
+            options.retryDelay = retryDelayValue;
+        }
+    }
+    
+    // Desactivar reintentos si se especifica --no-retry
+    if (args.includes('--no-retry')) {
+        options.maxRetries = 0;
+    }
+    
     // Si no hay argumentos o solo hay opciones, mostrar ayuda
     if (args.length === 0 || (args.length === 1 && args[0].startsWith('--'))) {
         if (!options.all) {
             console.log(`
-📦 Sincronización de Stocks Manager+ → Shopify
+📦 Sincronización de Stocks Manager+ → Shopify (Optimizado)
 
 Uso:
-  node syncStocks.js [SKU1] [SKU2] ... [SKUn]  - Sincronizar productos específicos
-  node syncStocks.js --all                      - Sincronizar todos los productos
-  node syncStocks.js --all --dry-run            - Simular sincronización sin cambios
+  node syncStocks.js [SKU1] [SKU2] ... [SKUn]        - Sincronizar productos específicos
+  node syncStocks.js --all                            - Sincronizar todos los productos
+  node syncStocks.js --all --dry-run                  - Simular sincronización sin cambios
 
 Opciones:
-  --dry-run    Simular sin hacer cambios reales
-  --force      Forzar actualización incluso si los stocks son iguales
+  --dry-run                 Simular sin hacer cambios reales
+  --force                   Forzar actualización incluso si los stocks son iguales
+  --concurrency=N           Número de productos a procesar en paralelo (default: 5)
+                            Recomendado: 5-10 para no sobrecargar las APIs
+                            Máximo permitido: 50
+  --max-retries=N           Número máximo de reintentos automáticos (default: 3)
+                            Se reintentan automáticamente los productos que fallan
+                            Por defecto: 3 intentos adicionales
+  --retry-delay=N           Milisegundos de espera entre reintentos (default: 2000)
+  --no-retry                Desactivar reintentos automáticos
+
+⚠️  IMPORTANTE - Concurrencia Alta:
+
+Si pones una concurrencia muy grande (ej: --concurrency=50 o más):
+
+1. ❌ Rate Limiting (429):
+   - Shopify permite ~40 peticiones por segundo por app
+   - Manager+ tiene límites propios (depende de tu plan)
+   - Errores: "Rate limit alcanzado" o código HTTP 429
+   - Solución: Reduce la concurrencia o espera entre lotes
+
+2. ❌ Sobre Carga del Servidor:
+   - Errores HTTP 500 (error del servidor)
+   - Timeouts y conexiones rechazadas
+   - Puede bloquear temporalmente tu acceso
+
+3. ❌ Consumo de Recursos:
+   - Más memoria RAM usada
+   - Más conexiones de red simultáneas
+   - Puede afectar el rendimiento del sistema
+
+4. ✅ Recomendaciones:
+   - Para pruebas: 3-5
+   - Producción: 5-10
+   - Solo si sabes que tu API lo soporta: 15-20
+   - NUNCA más de 50 (límite del sistema)
+
+🔄 REINTENTOS AUTOMÁTICOS:
+
+Por defecto, el sistema reintenta automáticamente los productos que fallan:
+  - Se reintentan solo errores recuperables (rate limits, errores temporales del servidor)
+  - NO se reintentan productos no encontrados o saltados
+  - Máximo 3 intentos adicionales por defecto
+  - Espera 2 segundos entre cada intento
+  - Usa menor concurrencia en reintentos para evitar más rate limits
+
+Ejemplos:
+  node syncStocks.js --all --dry-run --concurrency=10
+  node syncStocks.js ABC123 DEF456 --concurrency=3
+  node syncStocks.js --all --max-retries=5 --retry-delay=3000
+  node syncStocks.js --all --no-retry  # Sin reintentos automáticos
             `);
             process.exit(0);
         }

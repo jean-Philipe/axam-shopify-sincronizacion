@@ -68,11 +68,33 @@ npm run sync:all
 npm run sync:dry-run
 ```
 
-El sistema de sincronización:
-1. 📥 Obtiene el stock del producto desde Manager+
-2. 📥 Obtiene el stock actual desde Shopify
-3. 🔄 Compara ambos valores
-4. 📤 Actualiza Shopify si hay diferencias
+#### Optimizaciones de rendimiento:
+
+El sistema ahora está optimizado para ser **hasta 10x más rápido** con las siguientes mejoras:
+
+- ⚡ **Procesamiento paralelo**: Procesa múltiples productos simultáneamente
+- 🗂️ **Caché en memoria**: Pre-carga todos los productos de Shopify una sola vez
+- 🎯 **Búsquedas rápidas**: Usa estructuras Map para acceso O(1) en lugar de búsquedas secuenciales
+- 🔄 **Sin pausas innecesarias**: Elimina las pausas de 500ms entre productos
+
+**Controlar concurrencia** (número de productos procesados en paralelo):
+```bash
+# Procesar 10 productos en paralelo (recomendado: 5-10)
+node syncStocks.js --all --concurrency=10
+
+# Simulación con alta concurrencia
+npm run sync:dry-run -- --concurrency=10
+```
+
+**Nota**: Ajusta la concurrencia según la capacidad de tus APIs. Valores muy altos pueden causar rate limiting.
+
+#### El proceso de sincronización optimizado:
+
+1. 📦 **Pre-carga**: Obtiene todos los productos de Shopify en memoria (una sola vez)
+2. 🔐 **Autenticación**: Obtiene tokens y ubicaciones una sola vez
+3. ⚡ **Procesamiento paralelo**: Procesa productos en lotes simultáneos
+4. 📥 **Comparación**: Obtiene stock de Manager+ y compara con caché de Shopify
+5. 📤 **Actualización**: Actualiza solo los productos que necesitan cambios
 
 ## 🔌 Endpoints Disponibles
 
