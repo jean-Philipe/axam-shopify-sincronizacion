@@ -16,6 +16,9 @@ const ERP_PASSWORD = process.env.ERP_PASSWORD;
 const RUT_EMPRESA = process.env.RUT_EMPRESA;
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
+// Helper para esperar sin bloquear
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // Variable para almacenar el token de autenticación del ERP
 let erpAuthToken = null;
 let erpTokenExpirationTime = null;
@@ -25,6 +28,9 @@ let shopifyProductsCache = null;
 
 // Caché para locationId de Shopify
 let shopifyLocationIdCache = null;
+
+// Caché opcional de productos Manager+ para evitar múltiples llamadas por SKU
+let managerProductsCache = null;
 
 /**
  * Autenticarse con el ERP Manager+
@@ -62,32 +68,59 @@ async function getERPAuthToken() {
 
 
 /**
- * Extraer stock de un producto desde la respuesta del endpoint de productos
- * 
- * Cuando se usa con_stock=S, el stock viene en el campo "stock" (array de arrays)
- * donde cada objeto tiene un campo "saldo" que es el stock real
+ * Determina si un registro de stock pertenece a "Bodega General" y excluye "Bodega temporal".
+ */
+function isGeneralWarehouse(stockItem = {}) {
+    const name = (
+        stockItem.bodega ||
+        stockItem.almacen ||
+        stockItem.descripcion_bodega ||
+        stockItem.nombre_bodega ||
+        stockItem.bod ||
+        ''
+    ).toString().toLowerCase().trim();
+
+    // Si no hay nombre de bodega, asumimos bodega general (evita descartar todo por falta de campo)
+    if (!name) return true;
+
+    if (name.includes('temporal')) return false;
+    if (name.includes('general')) return true;
+
+    // Fallback: incluir otras bodegas solo si no son temporales
+    return !name.includes('temporal');
+}
+
+/**
+ * Extraer stock de un producto desde la respuesta del endpoint de productos,
+ * considerando únicamente la Bodega General y descartando bodegas temporales.
  * 
  * @param {Object} product - Objeto del producto de Manager+
- * @returns {number} Stock total del producto
+ * @returns {number} Stock total del producto (solo Bodega General)
  */
 function extractStockFromProduct(product) {
     let stock = 0;
-    
-    if (product.stock && Array.isArray(product.stock) && product.stock.length > 0) {
-        // Iterar sobre cada sub-array en el array principal
-        product.stock.forEach(subArray => {
-            if (Array.isArray(subArray)) {
-                // Sumar todos los "saldo" de cada objeto en el sub-array
-                subArray.forEach(item => {
-                    if (item && typeof item === 'object') {
-                        const saldo = item.saldo || 0;
-                        stock += parseFloat(saldo) || 0;
-                    }
-                });
-            }
-        });
+
+    // El campo stock puede venir como array de arrays o directamente array de objetos
+    const stockEntries = product.stock;
+    if (!Array.isArray(stockEntries)) {
+        return 0;
     }
-    
+
+    const processItem = (item) => {
+        if (!item || typeof item !== 'object') return;
+        if (!isGeneralWarehouse(item)) return;
+        const saldo = item.saldo || 0;
+        stock += parseFloat(saldo) || 0;
+    };
+
+    stockEntries.forEach(entry => {
+        if (Array.isArray(entry)) {
+            entry.forEach(processItem);
+        } else {
+            processItem(entry);
+        }
+    });
+
     return stock;
 }
 
@@ -99,7 +132,7 @@ function extractStockFromProduct(product) {
  * @param {string} sku - Código SKU del producto
  * @returns {Promise<Object>} Información del producto con stock
  */
-async function getManagerProductBySKU(sku) {
+async function getManagerProductBySKU(sku, attempt = 1) {
     try {
         const token = await getERPAuthToken();
         
@@ -142,8 +175,17 @@ async function getManagerProductBySKU(sku) {
             return null; // Producto no encontrado
         }
         
-        // Detectar rate limiting
+        // Detectar rate limiting con reintentos y backoff simple
         if (error.response?.status === 429) {
+            const retryAfterHeader = error.response?.headers?.['retry-after'];
+            const retryMs = retryAfterHeader ? (parseInt(retryAfterHeader, 10) * 1000) : Math.min(5000, 1500 * attempt);
+            
+            if (attempt < 3) {
+                console.warn(`⚠️  Rate limit en Manager+ para ${sku}. Reintentando en ${retryMs}ms (intento ${attempt + 1}/3)...`);
+                await sleep(retryMs);
+                return await getManagerProductBySKU(sku, attempt + 1);
+            }
+            
             throw new Error(`Rate limit alcanzado en Manager+ (429). Reduce la concurrencia.`);
         }
         
@@ -153,6 +195,108 @@ async function getManagerProductBySKU(sku) {
         }
         
         console.error(`   ❌ Error al obtener stock de ${sku} de Manager+: ${error.response?.data?.message || error.message}`);
+        throw error;
+    }
+}
+
+/**
+ * Cargar todos los productos con stock desde Manager+ en forma paginada.
+ * Esto permite evitar una llamada por SKU y reduce el riesgo de rate limiting.
+ *
+ * @param {Object} options
+ * @param {number} options.pageSize - Tamaño de página (recomendado 200-300, máx. 500 si el ERP lo permite)
+ * @param {number} options.pauseMs - Pausa entre páginas para no gatillar 429 (ms)
+ * @param {boolean} options.useCache - Reusar resultado previo en memoria (default: false)
+ * @param {boolean} options.forceReload - Ignorar caché aunque exista
+ * @returns {Promise<Map<string, Object>>} Mapa SKU -> info de producto
+ */
+async function loadAllManagerProductsWithStock(options = {}) {
+    const {
+        pageSize = 200,
+        pauseMs = 150,
+        useCache = false,
+        forceReload = false,
+        maxPages = 200
+    } = options;
+
+    if (useCache && managerProductsCache && !forceReload) {
+        return managerProductsCache;
+    }
+
+    const limit = Math.min(Math.max(1, pageSize), 500); // asegurar rango razonable
+    const productMap = new Map();
+    let offset = 0;
+    let page = 0;
+    let hasMore = true;
+
+    console.log(`📥 Cargando productos desde Manager+ en páginas de ${limit}...`);
+
+    try {
+        const token = await getERPAuthToken();
+
+        while (hasMore) {
+            if (page >= maxPages) {
+                console.warn(`⚠️  Se alcanzó el máximo de páginas (${maxPages}). Deteniendo precarga para evitar bucles.`);
+                break;
+            }
+
+            const prevSize = productMap.size;
+            const url = `${ERP_BASE_URL}/products/${RUT_EMPRESA}/`;
+            const response = await axios.get(url, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Token ${token}`
+                },
+                params: {
+                    con_stock: 'S',
+                    limit,
+                    offset
+                }
+            });
+
+            const data = response.data.data || response.data || [];
+            if (!Array.isArray(data) || data.length === 0) {
+                hasMore = false;
+                break;
+            }
+
+            data.forEach(product => {
+                const stock = extractStockFromProduct(product);
+                const sku = product.codigo_prod || product.cod_producto || product.codigo;
+                if (!sku) return;
+                productMap.set(sku, {
+                    sku,
+                    nombre: product.nombre || product.descripcion || product.descrip || '',
+                    stock,
+                    unidad: product.unidadstock || product.unidad || '',
+                    precio: product.precio || product.precio_unit || 0,
+                    rawData: product
+                });
+            });
+
+            offset += data.length;
+            page += 1;
+
+            process.stdout.write(`\r   Página ${page} | Productos acumulados: ${productMap.size}   `);
+
+            // Si no se agregaron nuevos SKUs, detener para evitar bucles
+            if (productMap.size === prevSize) {
+                console.warn(`\n⚠️  No se agregaron nuevos SKUs en la página ${page}. Posible paginación ignorada por el ERP. Deteniendo precarga.`);
+                hasMore = false;
+            } else if (data.length < limit) {
+                hasMore = false;
+            } else if (pauseMs > 0) {
+                await sleep(pauseMs);
+            }
+        }
+
+        process.stdout.write('\n');
+        console.log(`✅ Stock de Manager+ cargado en memoria: ${productMap.size} SKUs\n`);
+
+        managerProductsCache = productMap;
+        return productMap;
+    } catch (error) {
+        console.error('\n❌ Error al cargar productos de Manager+ en bloque:', error.response?.data || error.message);
         throw error;
     }
 }
@@ -390,14 +534,18 @@ async function updateShopifyStock(inventoryItemId, locationId, quantity) {
  * @param {number} locationId - ID de ubicación (opcional, se obtiene si no se proporciona)
  * @returns {Promise<Object>} Resultado de la sincronización
  */
-async function syncProductStock(sku, options = {}, shopifyProductsMap = null, locationId = null) {
+async function syncProductStock(sku, options = {}, shopifyProductsMap = null, locationId = null, managerProductsMap = null) {
     const { dryRun = false, forceUpdate = false } = options;
     
     try {
         // 1. Obtener stock de Manager+
-        let managerProduct;
+        let managerProduct = null;
         try {
-            managerProduct = await getManagerProductBySKU(sku);
+            if (managerProductsMap && managerProductsMap.has(sku)) {
+                managerProduct = managerProductsMap.get(sku);
+            } else {
+                managerProduct = await getManagerProductBySKU(sku);
+            }
         } catch (error) {
             return {
                 sku,
@@ -509,15 +657,31 @@ async function processInParallel(array, processor, concurrency = 5) {
             
             // Contar errores de rate limiting en este chunk
             const chunkRateLimitErrors = chunkResults.filter(r => 
-                r.error && (r.error.includes('Rate limit') || r.error.includes('429'))
+                r?.error && (r.error.includes('Rate limit') || r.error.includes('429'))
             ).length;
             
             rateLimitErrors += chunkRateLimitErrors;
             
-            // Si hay muchos errores de rate limiting, advertir
+            // Ajuste automático de concurrencia ante rate limiting
+            if (chunkRateLimitErrors > 0) {
+                const newConcurrency = Math.max(1, Math.floor(concurrency / 2));
+                const backoffMs = Math.min(10000, 1500 + (rateLimitErrors * 500));
+                
+                if (newConcurrency < concurrency) {
+                    console.warn(`\n⚠️  Rate limit detectado en el último lote (${chunkRateLimitErrors} casos).`);
+                    console.warn(`   Bajando concurrencia de ${concurrency} a ${newConcurrency} y esperando ${backoffMs}ms...\n`);
+                    concurrency = newConcurrency;
+                } else {
+                    console.warn(`\n⚠️  Rate limit detectado en el último lote (${chunkRateLimitErrors} casos). Esperando ${backoffMs}ms...\n`);
+                }
+                
+                await sleep(backoffMs);
+            }
+            
+            // Si hay muchos errores de rate limiting acumulados, mantener aviso
             if (rateLimitErrors >= MAX_RATE_LIMIT_ERRORS) {
-                console.warn(`\n⚠️  Se detectaron múltiples errores de rate limiting.`);
-                console.warn(`   Considera reducir la concurrencia con --concurrency=${Math.max(1, Math.floor(concurrency / 2))}\n`);
+                console.warn(`\n⚠️  Se detectaron múltiples errores de rate limiting (${rateLimitErrors}).`);
+                console.warn(`   La concurrencia actual es ${concurrency}. Considera reducirla manualmente si persiste.\n`);
             }
             
         } catch (error) {
@@ -583,6 +747,24 @@ async function syncMultipleProducts(skus, options = {}) {
         // Pre-cargar productos de Shopify en memoria (una sola vez)
         console.log('📦 Pre-cargando datos...');
         const shopifyProductsMap = await loadAllShopifyProducts();
+
+        // Pre-cargar productos de Manager+ en bloque para evitar 1 llamada por SKU (si está habilitado)
+        let managerProductsMap = null;
+        const useManagerBulk = options.useManagerBulk !== false;
+        if (useManagerBulk) {
+            try {
+                const pageSize = options.managerPageSize || 200;
+                const pauseMs = options.managerPagePauseMs || 150;
+                managerProductsMap = await loadAllManagerProductsWithStock({
+                    pageSize,
+                    pauseMs,
+                    useCache: false
+                });
+            } catch (error) {
+                console.warn('⚠️  No se pudo precargar Manager+ en bloque. Se usará fallback por SKU.');
+                console.warn(`   Detalle: ${error.message}`);
+            }
+        }
         
         // Obtener locationId una sola vez (si no es dry-run)
         let locationId = null;
@@ -597,7 +779,7 @@ async function syncMultipleProducts(skus, options = {}) {
             skus,
             async (sku) => {
                 try {
-                    const result = await syncProductStock(sku, options, shopifyProductsMap, locationId);
+                    const result = await syncProductStock(sku, options, shopifyProductsMap, locationId, managerProductsMap);
                     
                     // Mostrar resultado solo si hay algo relevante
                     if (result.action === 'updated' || result.action === 'would_update') {
@@ -673,7 +855,7 @@ async function syncMultipleProducts(skus, options = {}) {
                     failedSkus,
                     async (sku) => {
                         try {
-                            const result = await syncProductStock(sku, options, shopifyProductsMap, locationId);
+                            const result = await syncProductStock(sku, options, shopifyProductsMap, locationId, managerProductsMap);
                             
                             if (result.success) {
                                 console.log(`   ✅ Reintento exitoso: ${sku}`);
@@ -851,6 +1033,20 @@ if (require.main === module) {
     if (args.includes('--no-retry')) {
         options.maxRetries = 0;
     }
+
+    // Desactivar precarga masiva de Manager+ si se especifica --no-manager-bulk
+    if (args.includes('--no-manager-bulk')) {
+        options.useManagerBulk = false;
+    }
+
+    // Tamaño de página para precarga masiva de Manager+ (--manager-page-size=200)
+    const managerPageSizeArg = args.find(arg => arg.startsWith('--manager-page-size='));
+    if (managerPageSizeArg) {
+        const pageSizeValue = parseInt(managerPageSizeArg.split('=')[1]);
+        if (!isNaN(pageSizeValue) && pageSizeValue > 0) {
+            options.managerPageSize = pageSizeValue;
+        }
+    }
     
     // Si no hay argumentos o solo hay opciones, mostrar ayuda
     if (args.length === 0 || (args.length === 1 && args[0].startsWith('--'))) {
@@ -874,6 +1070,8 @@ Opciones:
                             Por defecto: 3 intentos adicionales
   --retry-delay=N           Milisegundos de espera entre reintentos (default: 2000)
   --no-retry                Desactivar reintentos automáticos
+  --no-manager-bulk         No precargar productos de Manager+ en bloque (usa 1 llamada por SKU)
+  --manager-page-size=N     Tamaño de página para precarga masiva de Manager+ (default: 200)
 
 ⚠️  IMPORTANTE - Concurrencia Alta:
 

@@ -46,26 +46,100 @@ Este script verificará:
 - ✅ Obtención de productos
 - ✅ Información de inventario
 
-### Sincronizar Stocks
+### Sincronizar Stocks (CLI)
 
-#### Sincronizar un producto específico:
+- Sincronizar un SKU (real):
 ```bash
 node syncStocks.js ABC123
 ```
 
-#### Sincronizar múltiples productos:
+- Sincronizar un SKU en simulación (sin actualizar Shopify):
+```bash
+node syncStocks.js ABC123 --dry-run
+```
+
+- Sincronizar varios SKUs:
 ```bash
 node syncStocks.js ABC123 DEF456 GHI789
 ```
 
-#### Sincronizar todos los productos:
+- Sincronizar todos los SKUs (real):
 ```bash
-npm run sync:all
+node syncStocks.js --all --concurrency=5
 ```
 
-#### Simular sincronización (sin hacer cambios):
+- Simular todos los SKUs (recomendado para probar):
 ```bash
-npm run sync:dry-run
+node syncStocks.js --all --dry-run --concurrency=5
+```
+
+#### Opciones útiles
+- `--concurrency=N`          Concurrencia hacia Shopify (default 5, recomendado 3-10)
+- `--dry-run`                No actualiza Shopify, solo muestra qué haría
+- `--force`                  Actualiza aunque los stocks coincidan
+- `--max-retries=N`          Reintentos automáticos (default 3)
+- `--retry-delay=MS`         Pausa entre reintentos (default 2000)
+- `--no-retry`               Desactiva reintentos
+- `--manager-page-size=N`    Tamaño de página para precarga masiva desde Manager+ (default 200)
+- `--no-manager-bulk`        Desactiva la precarga masiva y consulta SKU a SKU (más lento, más 429)
+
+#### Notas de inventario
+- El stock de Manager+ se carga en bloque con `con_stock=S` y se filtra solo “Bodega General”; las bodegas con “temporal” se descartan.
+- Si el ERP no respeta `offset/limit`, la precarga se corta al detectar páginas repetidas; puedes bajar `--manager-page-size` o usar `--no-manager-bulk` como fallback.
+
+### 🤖 Sincronización Automática (Scheduler)
+
+El scheduler ejecuta la sincronización automáticamente todos los días a las **12:00 PM** y **6:00 PM** (hora de Santiago de Chile).
+
+#### Iniciar el Scheduler:
+```bash
+npm run scheduler
+```
+
+O directamente:
+```bash
+node syncScheduler.js
+```
+
+#### Configuración del Scheduler:
+
+El scheduler se puede configurar mediante variables de entorno en el archivo `.env`:
+
+```env
+# Concurrencia para sincronización automática (default: 5)
+SYNC_CONCURRENCY=5
+
+# Número máximo de reintentos (default: 3)
+SYNC_MAX_RETRIES=3
+```
+
+#### Características:
+
+- ⏰ **Ejecución programada**: Automática a las 12:00 PM y 6:00 PM
+- 🌎 **Zona horaria**: Santiago de Chile (America/Santiago)
+- 🔄 **Reintentos automáticos**: Si algún producto falla, se reintenta automáticamente
+- 📝 **Logs detallados**: Muestra fecha, hora y resultados de cada sincronización
+- 🛡️ **Manejo de errores**: Si una sincronización falla, el scheduler continúa funcionando
+- 🔒 **Solo sincronización real**: No ejecuta dry-run, siempre actualiza los stocks
+
+#### Mantener el Scheduler ejecutándose:
+
+Para mantener el scheduler ejecutándose en un servidor, puedes usar:
+
+**Con PM2** (recomendado):
+```bash
+npm install -g pm2
+pm2 start syncScheduler.js --name sync-scheduler
+pm2 save
+pm2 startup
+```
+
+**Con systemd** (Linux):
+Crear un servicio systemd que ejecute el scheduler como servicio del sistema.
+
+**Con nohup**:
+```bash
+nohup node syncScheduler.js > scheduler.log 2>&1 &
 ```
 
 #### Optimizaciones de rendimiento:
