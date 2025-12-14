@@ -2,7 +2,7 @@
  * Scheduler para sincronización automática de stocks
  * 
  * Este script ejecuta la sincronización automáticamente todos los días
- * a las 12:00 PM (mediodía) y 6:00 PM en hora de Santiago de Chile
+ * a las 6:00 PM en hora de Santiago de Chile
  */
 
 require('dotenv').config();
@@ -110,23 +110,14 @@ function main() {
     console.log(`${colors.cyan}⏰ Configuración:${colors.reset}`);
     console.log(`   Zona horaria: ${TIMEZONE} (Santiago de Chile)`);
     console.log(`   Horarios programados:`);
-    console.log(`     - ${colors.green}12:00 PM (mediodía)${colors.reset} - Todos los días`);
     console.log(`     - ${colors.green}6:00 PM (18:00)${colors.reset} - Todos los días`);
     console.log(`   Concurrencia: ${CONCURRENCY}`);
     console.log(`   Reintentos máximos: ${MAX_RETRIES}`);
     console.log('='.repeat(70));
     console.log(`\n${colors.yellow}💡 El scheduler está activo. Presiona Ctrl+C para detenerlo.${colors.reset}\n`);
     
-    // Programar sincronización a las 12:00 PM (mediodía) - hora Santiago de Chile
-    // Formato cron: minuto hora día mes día-semana
-    // 0 12 * * * = Todos los días a las 12:00
-    cron.schedule('0 12 * * *', executeSync, {
-        scheduled: true,
-        timezone: TIMEZONE
-    });
-    console.log(`${colors.green}✅ Tarea programada: 12:00 PM (mediodía)${colors.reset}`);
-    
     // Programar sincronización a las 6:00 PM (18:00) - hora Santiago de Chile
+    // Formato cron: minuto hora día mes día-semana
     // 0 18 * * * = Todos los días a las 18:00
     cron.schedule('0 18 * * *', executeSync, {
         scheduled: true,
@@ -139,11 +130,9 @@ function main() {
     const santiagoTime = new Date(now.toLocaleString('en-US', { timeZone: TIMEZONE }));
     const currentHour = santiagoTime.getHours();
     
-    const nextSyncTime = currentHour < 12 
-        ? '12:00 PM (hoy)'
-        : currentHour < 18
+    const nextSyncTime = currentHour < 18
         ? '6:00 PM (hoy)'
-        : '12:00 PM (mañana)';
+        : '6:00 PM (mañana)';
     
     console.log(`\n${colors.cyan}⏭️  Próxima sincronización: ${nextSyncTime}${colors.reset}`);
     console.log(`\n${colors.bright}📅 Hora actual (Santiago): ${getFormattedDateTime()}${colors.reset}\n`);
