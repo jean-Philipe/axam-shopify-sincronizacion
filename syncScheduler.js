@@ -1,5 +1,5 @@
 /**
- * Scheduler para sincronización automática de stocks
+ * Scheduler para sincronización automática de stocks y precios
  * 
  * Este script ejecuta la sincronización automáticamente todos los días
  * a las 6:00 PM en hora de Santiago de Chile
@@ -7,7 +7,8 @@
 
 require('dotenv').config();
 const cron = require('node-cron');
-const { syncAllProducts } = require('./syncStocks');
+const { syncAllProducts: syncAllStocks } = require('./syncStocks');
+const { syncAllProducts: syncAllPrices } = require('./syncPricesShopify');
 
 // Configuración
 const TIMEZONE = 'America/Santiago'; // Zona horaria de Santiago de Chile
@@ -38,14 +39,14 @@ function getFormattedDateTime() {
 }
 
 /**
- * Función para ejecutar la sincronización
+ * Función para ejecutar la sincronización de stocks
  */
-async function executeSync() {
+async function executeStockSync() {
     const startTime = Date.now();
     const formattedStartTime = getFormattedDateTime();
     
     console.log('\n' + '='.repeat(70));
-    console.log(`${colors.cyan}🕐 Iniciando sincronización automática${colors.reset}`);
+    console.log(`${colors.cyan}📦 Iniciando sincronización de STOCKS${colors.reset}`);
     console.log(`${colors.bright}📅 Fecha/Hora (Santiago): ${formattedStartTime}${colors.reset}`);
     console.log('='.repeat(70));
     
@@ -57,20 +58,20 @@ async function executeSync() {
             retryDelay: 2000
         };
         
-        const results = await syncAllProducts(options);
+        const results = await syncAllStocks(options);
         
         const endTime = Date.now();
         const duration = ((endTime - startTime) / 1000).toFixed(2);
         const formattedEndTime = getFormattedDateTime();
         
         console.log('\n' + '='.repeat(70));
-        console.log(`${colors.green}✅ Sincronización completada exitosamente${colors.reset}`);
+        console.log(`${colors.green}✅ Sincronización de STOCKS completada exitosamente${colors.reset}`);
         console.log(`${colors.bright}📅 Finalizada a las: ${formattedEndTime}${colors.reset}`);
         console.log(`${colors.bright}⏱️  Duración total: ${duration} segundos${colors.reset}`);
         console.log('='.repeat(70));
         
         // Resumen rápido
-        console.log(`\n📊 Resumen:`);
+        console.log(`\n📊 Resumen de STOCKS:`);
         console.log(`   ${colors.green}✅ Actualizados: ${results.updated}${colors.reset}`);
         console.log(`   ${colors.blue}ℹ️  Sin cambios: ${results.noChange}${colors.reset}`);
         console.log(`   ${colors.yellow}⏭️  Omitidos: ${results.skipped}${colors.reset}`);
@@ -80,6 +81,150 @@ async function executeSync() {
         console.log('');
         
         return results;
+        
+    } catch (error) {
+        const formattedErrorTime = getFormattedDateTime();
+        console.error('\n' + '='.repeat(70));
+        console.error(`${colors.red}❌ Error fatal en sincronización de STOCKS${colors.reset}`);
+        console.error(`${colors.bright}📅 Hora del error: ${formattedErrorTime}${colors.reset}`);
+        console.error(`${colors.red}Error: ${error.message}${colors.reset}`);
+        console.error('='.repeat(70) + '\n');
+        
+        // No lanzar el error para que el scheduler continúe funcionando
+        // Solo loguear para debugging
+        if (error.stack) {
+            console.error('Stack trace:');
+            console.error(error.stack);
+        }
+        
+        return null;
+    }
+}
+
+/**
+ * Función para ejecutar la sincronización de precios
+ */
+async function executePriceSync() {
+    const startTime = Date.now();
+    const formattedStartTime = getFormattedDateTime();
+    
+    console.log('\n' + '='.repeat(70));
+    console.log(`${colors.cyan}💰 Iniciando sincronización de PRECIOS${colors.reset}`);
+    console.log(`${colors.bright}📅 Fecha/Hora (Santiago): ${formattedStartTime}${colors.reset}`);
+    console.log('='.repeat(70));
+    
+    try {
+        const options = {
+            dryRun: false, // SIEMPRE sincronización real
+            concurrency: CONCURRENCY,
+            maxRetries: MAX_RETRIES,
+            retryDelay: 2000
+        };
+        
+        const results = await syncAllPrices(options);
+        
+        const endTime = Date.now();
+        const duration = ((endTime - startTime) / 1000).toFixed(2);
+        const formattedEndTime = getFormattedDateTime();
+        
+        console.log('\n' + '='.repeat(70));
+        console.log(`${colors.green}✅ Sincronización de PRECIOS completada exitosamente${colors.reset}`);
+        console.log(`${colors.bright}📅 Finalizada a las: ${formattedEndTime}${colors.reset}`);
+        console.log(`${colors.bright}⏱️  Duración total: ${duration} segundos${colors.reset}`);
+        console.log('='.repeat(70));
+        
+        // Resumen rápido
+        console.log(`\n📊 Resumen de PRECIOS:`);
+        console.log(`   ${colors.green}✅ Actualizados: ${results.updated}${colors.reset}`);
+        console.log(`   ${colors.blue}ℹ️  Sin cambios: ${results.noChange}${colors.reset}`);
+        console.log(`   ${colors.yellow}⏭️  Omitidos: ${results.skipped}${colors.reset}`);
+        if (results.errors > 0) {
+            console.log(`   ${colors.red}❌ Errores: ${results.errors}${colors.reset}`);
+        }
+        console.log('');
+        
+        return results;
+        
+    } catch (error) {
+        const formattedErrorTime = getFormattedDateTime();
+        console.error('\n' + '='.repeat(70));
+        console.error(`${colors.red}❌ Error fatal en sincronización de PRECIOS${colors.reset}`);
+        console.error(`${colors.bright}📅 Hora del error: ${formattedErrorTime}${colors.reset}`);
+        console.error(`${colors.red}Error: ${error.message}${colors.reset}`);
+        console.error('='.repeat(70) + '\n');
+        
+        // No lanzar el error para que el scheduler continúe funcionando
+        // Solo loguear para debugging
+        if (error.stack) {
+            console.error('Stack trace:');
+            console.error(error.stack);
+        }
+        
+        return null;
+    }
+}
+
+/**
+ * Función para ejecutar todas las sincronizaciones (stocks y precios)
+ */
+async function executeSync() {
+    const globalStartTime = Date.now();
+    const formattedStartTime = getFormattedDateTime();
+    
+    console.log('\n' + '='.repeat(70));
+    console.log(`${colors.cyan}🕐 Iniciando sincronización automática completa${colors.reset}`);
+    console.log(`${colors.bright}📅 Fecha/Hora (Santiago): ${formattedStartTime}${colors.reset}`);
+    console.log('='.repeat(70));
+    
+    try {
+        // Ejecutar sincronización de stocks primero
+        const stockResults = await executeStockSync();
+        
+        // Esperar un poco antes de sincronizar precios (para no sobrecargar las APIs)
+        console.log(`\n${colors.yellow}⏳ Esperando 5 segundos antes de sincronizar precios...${colors.reset}\n`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // Ejecutar sincronización de precios
+        const priceResults = await executePriceSync();
+        
+        const globalEndTime = Date.now();
+        const globalDuration = ((globalEndTime - globalStartTime) / 1000).toFixed(2);
+        const formattedEndTime = getFormattedDateTime();
+        
+        console.log('\n' + '='.repeat(70));
+        console.log(`${colors.green}✅ Sincronización completa finalizada exitosamente${colors.reset}`);
+        console.log(`${colors.bright}📅 Finalizada a las: ${formattedEndTime}${colors.reset}`);
+        console.log(`${colors.bright}⏱️  Duración total: ${globalDuration} segundos${colors.reset}`);
+        console.log('='.repeat(70));
+        
+        // Resumen global
+        console.log(`\n📊 Resumen Global:`);
+        console.log(`\n   ${colors.cyan}📦 STOCKS:${colors.reset}`);
+        if (stockResults) {
+            console.log(`      ${colors.green}✅ Actualizados: ${stockResults.updated}${colors.reset}`);
+            console.log(`      ${colors.blue}ℹ️  Sin cambios: ${stockResults.noChange}${colors.reset}`);
+            console.log(`      ${colors.yellow}⏭️  Omitidos: ${stockResults.skipped}${colors.reset}`);
+            if (stockResults.errors > 0) {
+                console.log(`      ${colors.red}❌ Errores: ${stockResults.errors}${colors.reset}`);
+            }
+        } else {
+            console.log(`      ${colors.red}❌ Error en sincronización${colors.reset}`);
+        }
+        
+        console.log(`\n   ${colors.cyan}💰 PRECIOS:${colors.reset}`);
+        if (priceResults) {
+            console.log(`      ${colors.green}✅ Actualizados: ${priceResults.updated}${colors.reset}`);
+            console.log(`      ${colors.blue}ℹ️  Sin cambios: ${priceResults.noChange}${colors.reset}`);
+            console.log(`      ${colors.yellow}⏭️  Omitidos: ${priceResults.skipped}${colors.reset}`);
+            if (priceResults.errors > 0) {
+                console.log(`      ${colors.red}❌ Errores: ${priceResults.errors}${colors.reset}`);
+            }
+        } else {
+            console.log(`      ${colors.red}❌ Error en sincronización${colors.reset}`);
+        }
+        console.log('');
+        
+        return { stockResults, priceResults };
         
     } catch (error) {
         const formattedErrorTime = getFormattedDateTime();
@@ -105,12 +250,14 @@ async function executeSync() {
  */
 function main() {
     console.log('\n' + '='.repeat(70));
-    console.log(`${colors.bright}🚀 Scheduler de Sincronización de Stocks${colors.reset}`);
+    console.log(`${colors.bright}🚀 Scheduler de Sincronización (Stocks y Precios)${colors.reset}`);
     console.log('='.repeat(70));
     console.log(`${colors.cyan}⏰ Configuración:${colors.reset}`);
     console.log(`   Zona horaria: ${TIMEZONE} (Santiago de Chile)`);
     console.log(`   Horarios programados:`);
     console.log(`     - ${colors.green}6:00 PM (18:00)${colors.reset} - Todos los días`);
+    console.log(`       • Sincronización de Stocks`);
+    console.log(`       • Sincronización de Precios`);
     console.log(`   Concurrencia: ${CONCURRENCY}`);
     console.log(`   Reintentos máximos: ${MAX_RETRIES}`);
     console.log('='.repeat(70));
@@ -124,6 +271,8 @@ function main() {
         timezone: TIMEZONE
     });
     console.log(`${colors.green}✅ Tarea programada: 6:00 PM (18:00)${colors.reset}`);
+    console.log(`   ${colors.cyan}📦 Stocks: Manager+ → Shopify${colors.reset}`);
+    console.log(`   ${colors.cyan}💰 Precios: Manager+ (Lista 18) → Shopify${colors.reset}`);
     
     // Mostrar próximo evento programado
     const now = new Date();
@@ -161,5 +310,7 @@ if (require.main === module) {
 
 module.exports = {
     executeSync,
+    executeStockSync,
+    executePriceSync,
     main
 };
