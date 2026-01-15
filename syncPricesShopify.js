@@ -476,11 +476,19 @@ async function updateShopifyPrice(productId, variantId, price) {
     } catch (error) {
         // Detectar rate limiting de Shopify
         if (error.response?.status === 429) {
-            const retryAfter = error.response.headers['retry-after'];
-            const message = retryAfter 
-                ? `Rate limit de Shopify alcanzado. Espera ${retryAfter} segundos antes de continuar.`
-                : `Rate limit de Shopify alcanzado (429). Reduce la concurrencia o espera un momento.`;
+            const retryAfter = error.response.headers['retry-after'] || error.response.headers['Retry-After'];
+            const waitTime = retryAfter ? parseInt(retryAfter) : 5;
+            const message = `Rate limit de Shopify alcanzado. Espera ${waitTime} segundos antes de continuar.`;
             throw new Error(message);
+        }
+        
+        // Detectar errores 422 (variantes que no existen o no pertenecen al producto)
+        if (error.response?.status === 422) {
+            const errorData = error.response?.data;
+            if (errorData?.errors?.variants) {
+                throw new Error('Variante no existe o no pertenece al producto (422)');
+            }
+            throw new Error(`Error de validación en Shopify (422): ${JSON.stringify(errorData?.errors || errorData)}`);
         }
         
         // Detectar errores de autenticación
@@ -493,7 +501,7 @@ async function updateShopifyPrice(productId, variantId, price) {
             throw new Error(`Error del servidor Shopify (${error.response.status}). Puede estar sobrecargado.`);
         }
         
-        console.error('❌ Error al actualizar precio en Shopify:', error.response?.data || error.message);
+        // No loguear errores aquí, se manejarán en la función que llama
         throw error;
     }
 }
@@ -615,18 +623,20 @@ async function syncProductPrice(sku, options = {}, shopifyProductsMap = null, pr
 async function processInParallel(array, processor, concurrency = 5) {
     const results = [];
     let rateLimitErrors = 0;
-    const MAX_RATE_LIMIT_ERRORS = 5;
+    let currentConcurrency = concurrency;
     const logs = []; // Acumular logs para mostrarlos después del chunk
+    let lastRateLimitTime = 0;
+    let rateLimitWaitTime = 0;
     
-    for (let i = 0; i < array.length; i += concurrency) {
-        const chunk = array.slice(i, i + concurrency);
+    for (let i = 0; i < array.length; i += currentConcurrency) {
+        const chunk = array.slice(i, i + currentConcurrency);
         
         try {
             // Procesar chunk en paralelo - todos los productos del chunk se procesan simultáneamente
             const chunkPromises = chunk.map(processor);
             const chunkResults = await Promise.all(chunkPromises);
             
-            // Acumular logs
+            // Acumular logs (excluir errores de rate limit repetitivos)
             chunkResults.forEach(result => {
                 if (result.action === 'updated' || result.action === 'would_update') {
                     logs.push(`   ✅ ${result.sku}: $${result.shopifyPrice} → $${result.managerPrice} (lista ${result.listaUsada})`);
@@ -635,7 +645,10 @@ async function processInParallel(array, processor, concurrency = 5) {
                 } else if (result.action === 'skipped') {
                     logs.push(`   ⏭️  ${result.sku}: omitido (${result.error || result.message || 'motivo no especificado'})`);
                 } else if (result.action === 'error' || !result.success) {
-                    logs.push(`   ❌ ${result.sku}: ${result.error || 'error desconocido'}`);
+                    // Solo mostrar errores que NO sean rate limit
+                    if (!result.error || (!result.error.includes('Rate limit') && !result.error.includes('429'))) {
+                        logs.push(`   ❌ ${result.sku}: ${result.error || 'error desconocido'}`);
+                    }
                 }
             });
             
@@ -645,31 +658,77 @@ async function processInParallel(array, processor, concurrency = 5) {
             
             results.push(...chunkResults);
             
-            // Contar errores de rate limiting en este chunk
+            // Detectar y manejar rate limiting
             const chunkRateLimitErrors = chunkResults.filter(r => 
                 r.error && (r.error.includes('Rate limit') || r.error.includes('429'))
-            ).length;
+            );
             
-            rateLimitErrors += chunkRateLimitErrors;
-            
-            // Si hay muchos errores de rate limiting, advertir
-            if (rateLimitErrors >= MAX_RATE_LIMIT_ERRORS) {
-                console.warn(`\n⚠️  Se detectaron múltiples errores de rate limiting.`);
-                console.warn(`   Considera reducir la concurrencia con --concurrency=${Math.max(1, Math.floor(concurrency / 2))}\n`);
+            if (chunkRateLimitErrors.length > 0) {
+                rateLimitErrors += chunkRateLimitErrors.length;
+                const now = Date.now();
+                
+                // Extraer tiempo de espera del primer error de rate limit
+                const firstRateLimitError = chunkRateLimitErrors[0];
+                const waitMatch = firstRateLimitError.error?.match(/Espera (\d+(?:\.\d+)?) segundos/);
+                const suggestedWait = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 5;
+                
+                // Si hay múltiples rate limits seguidos, esperar más tiempo
+                if (now - lastRateLimitTime < 10000) { // Si fue hace menos de 10 segundos
+                    rateLimitWaitTime = Math.max(rateLimitWaitTime, suggestedWait * 2);
+                } else {
+                    rateLimitWaitTime = Math.max(suggestedWait, 5);
+                }
+                
+                lastRateLimitTime = now;
+                
+                // Reducir concurrencia si hay rate limits
+                if (currentConcurrency > 2) {
+                    currentConcurrency = Math.max(2, Math.floor(currentConcurrency / 2));
+                    console.log(`\n⚠️  Rate limit detectado (${chunkRateLimitErrors.length} casos). Reduciendo concurrencia a ${currentConcurrency} y esperando ${rateLimitWaitTime}s...`);
+                } else {
+                    console.log(`\n⚠️  Rate limit detectado (${chunkRateLimitErrors.length} casos). Esperando ${rateLimitWaitTime}s antes de continuar...`);
+                }
+                
+                // Esperar antes de continuar
+                for (let wait = rateLimitWaitTime; wait > 0; wait--) {
+                    process.stdout.write(`\r   ⏱️  Esperando ${wait} segundo${wait > 1 ? 's' : ''}...`);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+                process.stdout.write('\r   ✅ Espera completada. Continuando...\n');
+                
+                // Resetear contador después de esperar
+                rateLimitWaitTime = 0;
+            } else {
+                // Si no hay rate limits, intentar aumentar la concurrencia gradualmente
+                if (currentConcurrency < concurrency && rateLimitErrors === 0) {
+                    currentConcurrency = Math.min(concurrency, currentConcurrency + 1);
+                }
             }
             
         } catch (error) {
-            // Si es un error de rate limit global, esperar un poco y continuar
+            // Si es un error de rate limit global, esperar y continuar
             if (error.message && error.message.includes('Rate limit')) {
-                console.warn(`\n⚠️  Rate limit detectado. Esperando 2 segundos antes de continuar...`);
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                const waitMatch = error.message.match(/Espera (\d+(?:\.\d+)?) segundos/);
+                const waitTime = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 5;
+                
+                console.log(`\n⚠️  Rate limit detectado. Esperando ${waitTime} segundos antes de continuar...`);
+                for (let wait = waitTime; wait > 0; wait--) {
+                    process.stdout.write(`\r   ⏱️  Esperando ${wait} segundo${wait > 1 ? 's' : ''}...`);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+                process.stdout.write('\r   ✅ Espera completada. Continuando...\n');
+                
+                // Reducir concurrencia
+                if (currentConcurrency > 2) {
+                    currentConcurrency = Math.max(2, Math.floor(currentConcurrency / 2));
+                }
             } else {
                 throw error;
             }
         }
         
         // Mostrar progreso
-        const processed = Math.min(i + concurrency, array.length);
+        const processed = Math.min(i + currentConcurrency, array.length);
         console.log(`\r   Procesando: ${processed}/${array.length} productos...`);
     }
     
@@ -771,15 +830,28 @@ async function syncMultipleProducts(skus, options = {}) {
             !r.error.includes('Sin precio')
         );
         
+        // Separar productos con rate limit de otros errores
+        const rateLimitFailures = failedProducts.filter(r => 
+            r.error && (r.error.includes('Rate limit') || r.error.includes('429'))
+        );
+        const otherFailures = failedProducts.filter(r => 
+            !r.error || (!r.error.includes('Rate limit') && !r.error.includes('429'))
+        );
+        
         if (failedProducts.length > 0 && !options.dryRun) {
             const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 3;
             const retryDelay = options.retryDelay !== undefined ? options.retryDelay : 2000;
             
             console.log(`\n🔄 Reintentando ${failedProducts.length} productos que fallaron...`);
-            console.log(`   Intentos máximos: ${maxRetries}`);
-            console.log(`   Retraso entre intentos: ${retryDelay}ms\n`);
-            
-            await new Promise(resolve => setTimeout(resolve, retryDelay));
+            if (rateLimitFailures.length > 0) {
+                console.log(`   ⚠️  ${rateLimitFailures.length} productos fallaron por rate limiting`);
+                console.log(`   ⏳ Esperando 10 segundos antes de reintentar (para evitar más rate limits)...`);
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            } else {
+                console.log(`   Intentos máximos: ${maxRetries}`);
+                console.log(`   Retraso entre intentos: ${retryDelay}ms\n`);
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+            }
             
             let retryAttempt = 1;
             let remainingFailures = [...failedProducts];
@@ -787,7 +859,20 @@ async function syncMultipleProducts(skus, options = {}) {
             while (remainingFailures.length > 0 && retryAttempt <= maxRetries) {
                 console.log(`\n🔄 Intento ${retryAttempt}/${maxRetries} de reintento...`);
                 
-                const retryConcurrency = Math.max(2, Math.floor(concurrency / 2));
+                // Detectar si hay rate limits en los fallos anteriores
+                const hasRateLimitErrors = remainingFailures.some(r => 
+                    r.error && (r.error.includes('Rate limit') || r.error.includes('429'))
+                );
+                
+                // Si hay rate limits, usar concurrencia muy baja y esperar más
+                let retryConcurrency = hasRateLimitErrors ? 2 : Math.max(2, Math.floor(concurrency / 2));
+                let initialWait = hasRateLimitErrors ? 10000 : retryDelay;
+                
+                if (hasRateLimitErrors && retryAttempt === 1) {
+                    console.log(`   ⚠️  Detectados errores de rate limiting. Usando concurrencia baja (${retryConcurrency}) y esperando ${initialWait/1000}s...`);
+                    await new Promise(resolve => setTimeout(resolve, initialWait));
+                }
+                
                 const failedSkus = remainingFailures.map(r => r.sku);
                 
                 const retryProcessedResults = await processInParallel(
@@ -844,9 +929,28 @@ async function syncMultipleProducts(skus, options = {}) {
                     !r.error.includes('Sin precio')
                 );
                 
+                // Verificar si hay rate limits en los fallos restantes
+                const stillHasRateLimits = remainingFailures.some(r => 
+                    r.error && (r.error.includes('Rate limit') || r.error.includes('429'))
+                );
+                
                 if (remainingFailures.length > 0 && retryAttempt < maxRetries) {
-                    console.log(`   ⚠️  ${remainingFailures.length} productos aún fallan. Esperando ${retryDelay}ms antes del próximo intento...`);
-                    await new Promise(resolve => setTimeout(resolve, retryDelay));
+                    // Esperar más tiempo si hay rate limits
+                    const waitTime = stillHasRateLimits ? 10000 : retryDelay;
+                    const waitSeconds = Math.ceil(waitTime / 1000);
+                    
+                    if (stillHasRateLimits) {
+                        console.log(`   ⚠️  ${remainingFailures.length} productos aún fallan (incluyendo rate limits).`);
+                        console.log(`   ⏳ Esperando ${waitSeconds} segundos antes del próximo intento...`);
+                        for (let wait = waitSeconds; wait > 0; wait--) {
+                            process.stdout.write(`\r      ⏱️  ${wait} segundo${wait > 1 ? 's' : ''} restante${wait > 1 ? 's' : ''}...`);
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+                        process.stdout.write('\r      ✅ Espera completada.\n');
+                    } else {
+                        console.log(`   ⚠️  ${remainingFailures.length} productos aún fallan. Esperando ${waitSeconds}s antes del próximo intento...`);
+                        await new Promise(resolve => setTimeout(resolve, waitTime));
+                    }
                 }
                 
                 retryAttempt++;
@@ -854,8 +958,25 @@ async function syncMultipleProducts(skus, options = {}) {
             
             if (remainingFailures.length > 0) {
                 console.log(`\n⚠️  Después de ${maxRetries} intentos, ${remainingFailures.length} productos aún fallan:`);
+                // Agrupar errores similares para no mostrar muchos logs repetitivos
+                const errorGroups = {};
                 remainingFailures.forEach(failure => {
-                    console.log(`   ❌ ${failure.sku}: ${failure.error}`);
+                    const errorKey = failure.error || 'Error desconocido';
+                    if (!errorGroups[errorKey]) {
+                        errorGroups[errorKey] = [];
+                    }
+                    errorGroups[errorKey].push(failure.sku);
+                });
+                
+                Object.entries(errorGroups).forEach(([error, skus]) => {
+                    if (skus.length <= 3) {
+                        skus.forEach(sku => {
+                            console.log(`   ❌ ${sku}: ${error}`);
+                        });
+                    } else {
+                        console.log(`   ❌ ${skus.length} productos con: ${error}`);
+                        console.log(`      Ejemplos: ${skus.slice(0, 3).join(', ')}...`);
+                    }
                 });
             } else {
                 console.log(`\n✅ Todos los productos fallidos fueron actualizados exitosamente después de los reintentos.`);
