@@ -749,6 +749,7 @@ async function syncMultipleProducts(skus, options = {}) {
         skipped: 0,
         errors: 0,
         noChange: 0,
+        notFound: 0, // Productos no encontrados en el ERP (errores 422)
         details: []
     };
     
@@ -819,18 +820,30 @@ async function syncMultipleProducts(skus, options = {}) {
                     results.skipped++;
                 }
             } else {
-                results.errors++;
+                // Separar errores 422 (productos no encontrados en el ERP) de otros errores
+                if (result.error && (
+                    result.error.includes('422') || 
+                    result.error.includes('Variante no existe') ||
+                    result.error.includes('no encontrado en Manager+')
+                )) {
+                    results.notFound++;
+                } else {
+                    results.errors++;
+                }
             }
         });
         
         // Reintentos automáticos
+        // Excluir errores 422 (productos no encontrados) ya que no son recuperables
         const failedProducts = results.details.filter(r => 
             !r.success && 
             r.action === 'error' &&
             r.error && 
             !r.error.includes('no encontrado') &&
             !r.error.includes('skipped') &&
-            !r.error.includes('Sin precio')
+            !r.error.includes('Sin precio') &&
+            !r.error.includes('422') &&
+            !r.error.includes('Variante no existe')
         );
         
         // Separar productos con rate limit de otros errores
@@ -841,11 +854,38 @@ async function syncMultipleProducts(skus, options = {}) {
             !r.error || (!r.error.includes('Rate limit') && !r.error.includes('429'))
         );
         
+        // Contar productos no encontrados (422) que no se reintentarán
+        const notFoundProducts = results.details.filter(r => 
+            !r.success && 
+            r.action === 'error' &&
+            r.error && (
+                r.error.includes('422') || 
+                r.error.includes('Variante no existe') ||
+                r.error.includes('no encontrado en Manager+')
+            )
+        );
+        
+        if (notFoundProducts.length > 0) {
+            console.log(`\n📋 ${notFoundProducts.length} producto(s) no encontrado(s) en Manager+ (errores 422):`);
+            console.log(`   ℹ️  Estos productos no se reintentarán ya que no existen en el ERP`);
+            if (notFoundProducts.length <= 10) {
+                notFoundProducts.forEach(p => {
+                    console.log(`      - ${p.sku}`);
+                });
+            } else {
+                notFoundProducts.slice(0, 10).forEach(p => {
+                    console.log(`      - ${p.sku}`);
+                });
+                console.log(`      ... y ${notFoundProducts.length - 10} más`);
+            }
+            console.log('');
+        }
+        
         if (failedProducts.length > 0 && !options.dryRun) {
             const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 3;
             const retryDelay = options.retryDelay !== undefined ? options.retryDelay : 2000;
             
-            console.log(`\n🔄 Reintentando ${failedProducts.length} productos que fallaron...`);
+            console.log(`\n🔄 Reintentando ${failedProducts.length} productos que fallaron (excluyendo productos no encontrados)...`);
             if (rateLimitFailures.length > 0) {
                 console.log(`   ⚠️  ${rateLimitFailures.length} productos fallaron por rate limiting`);
                 console.log(`   ⏳ Esperando 10 segundos antes de reintentar (para evitar más rate limits)...`);
@@ -911,7 +951,19 @@ async function syncMultipleProducts(skus, options = {}) {
                         results.details[originalIndex] = retryResult;
                         
                         if (retryResult.success && wasError) {
-                            results.errors--;
+                            // Determinar qué contador reducir basándose en el error original
+                            const wasNotFound = originalResult.error && (
+                                originalResult.error.includes('422') || 
+                                originalResult.error.includes('Variante no existe') ||
+                                originalResult.error.includes('no encontrado en Manager+')
+                            );
+                            
+                            if (wasNotFound) {
+                                results.notFound--;
+                            } else {
+                                results.errors--;
+                            }
+                            
                             if (retryResult.action === 'updated' || retryResult.action === 'would_update') {
                                 results.updated++;
                             } else if (retryResult.action === 'no_change') {
@@ -929,7 +981,9 @@ async function syncMultipleProducts(skus, options = {}) {
                     r.error && 
                     !r.error.includes('no encontrado') &&
                     !r.error.includes('skipped') &&
-                    !r.error.includes('Sin precio')
+                    !r.error.includes('Sin precio') &&
+                    !r.error.includes('422') &&
+                    !r.error.includes('Variante no existe')
                 );
                 
                 // Verificar si hay rate limits en los fallos restantes
@@ -994,7 +1048,12 @@ async function syncMultipleProducts(skus, options = {}) {
         console.log(`   ✅ Actualizados: ${results.updated}`);
         console.log(`   ℹ️  Sin cambios: ${results.noChange}`);
         console.log(`   ⏭️  Omitidos: ${results.skipped}`);
-        console.log(`   ❌ Errores finales: ${results.errors}`);
+        if (results.notFound > 0) {
+            console.log(`   🔍 No encontrados en Manager+: ${results.notFound} (no se reintentan)`);
+        }
+        if (results.errors > 0) {
+            console.log(`   ❌ Errores finales: ${results.errors}`);
+        }
         console.log(`   ⏱️  Tiempo total: ${duration}s`);
         console.log(`   ⚡ Velocidad: ${(results.total / duration).toFixed(2)} productos/segundo`);
         console.log('='.repeat(60));

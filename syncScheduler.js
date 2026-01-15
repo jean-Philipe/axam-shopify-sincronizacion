@@ -147,6 +147,9 @@ async function executePriceSync() {
         console.log(`   ${colors.green}✅ Actualizados: ${results.updated}${colors.reset}`);
         console.log(`   ${colors.blue}ℹ️  Sin cambios: ${results.noChange}${colors.reset}`);
         console.log(`   ${colors.yellow}⏭️  Omitidos: ${results.skipped}${colors.reset}`);
+        if (results.notFound > 0) {
+            console.log(`   ${colors.cyan}🔍 No encontrados en Manager+: ${results.notFound}${colors.reset}`);
+        }
         if (results.errors > 0) {
             console.log(`   ${colors.red}❌ Errores: ${results.errors}${colors.reset}`);
         }
@@ -281,6 +284,9 @@ async function executeSync() {
             console.log(`      ${colors.green}✅ Actualizados: ${priceResults.updated}${colors.reset}`);
             console.log(`      ${colors.blue}ℹ️  Sin cambios: ${priceResults.noChange}${colors.reset}`);
             console.log(`      ${colors.yellow}⏭️  Omitidos: ${priceResults.skipped}${colors.reset}`);
+            if (priceResults.notFound > 0) {
+                console.log(`      ${colors.cyan}🔍 No encontrados en Manager+: ${priceResults.notFound}${colors.reset}`);
+            }
             if (priceResults.errors > 0) {
                 console.log(`      ${colors.red}❌ Errores: ${priceResults.errors}${colors.reset}`);
             }
