@@ -620,7 +620,7 @@ async function syncProductPrice(sku, options = {}, shopifyProductsMap = null, pr
  * @param {number} concurrency - Número máximo de operaciones paralelas
  * @returns {Promise<Array>} Resultados del procesamiento
  */
-async function processInParallel(array, processor, concurrency = 5) {
+async function processInParallel(array, processor, concurrency = 20) {
     const results = [];
     let rateLimitErrors = 0;
     let currentConcurrency = concurrency;
@@ -753,7 +753,10 @@ async function syncMultipleProducts(skus, options = {}) {
     };
     
     // Validar y limitar concurrencia
-    let concurrency = options.concurrency || 5;
+    // Por defecto, usar 20 para sincronización de precios
+    // Solo se reducirá si se detectan rate limits durante la ejecución
+    let concurrency = options.concurrency !== undefined ? options.concurrency : 20;
+    const DEFAULT_CONCURRENCY = 20; // Valor por defecto para precios
     const MAX_RECOMMENDED_CONCURRENCY = 20;
     const ABSOLUTE_MAX_CONCURRENCY = 50;
     
@@ -762,7 +765,7 @@ async function syncMultipleProducts(skus, options = {}) {
         concurrency = ABSOLUTE_MAX_CONCURRENCY;
     } else if (concurrency > MAX_RECOMMENDED_CONCURRENCY) {
         console.warn(`⚠️  Advertencia: Concurrencia de ${concurrency} es alta. Puede causar rate limiting.`);
-        console.warn(`   Recomendado: 5-10 para evitar problemas con las APIs.\n`);
+        console.warn(`   Valor recomendado: hasta ${MAX_RECOMMENDED_CONCURRENCY} para evitar problemas con las APIs.\n`);
     }
     
     console.log(`\n🚀 Iniciando sincronización optimizada de ${skus.length} SKUs`);

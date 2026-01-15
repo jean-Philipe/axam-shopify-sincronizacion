@@ -114,13 +114,18 @@ async function executePriceSync() {
     console.log('\n' + '='.repeat(70));
     console.log(`${colors.cyan}💰 SINCRONIZACIÓN DE PRECIOS${colors.reset}`);
     console.log(`${colors.bright}📅 Fecha/Hora (Santiago): ${formattedStartTime}${colors.reset}`);
-    console.log(`${colors.bright}🔄 Origen: Manager+ (Lista 18) → Destino: Shopify${colors.reset}`);
+    console.log(`${colors.bright}🔄 Origen: Manager+ (Lista 652) → Destino: Shopify${colors.reset}`);
     console.log('='.repeat(70));
     
     try {
+        // La sincronización de precios siempre parte con concurrencia 20
+        // independientemente de lo que pasó con stocks
+        // Solo se reducirá si detecta rate limits durante la sincronización de precios
+        const PRICE_CONCURRENCY = 20;
+        
         const options = {
             dryRun: false, // SIEMPRE sincronización real
-            concurrency: CONCURRENCY,
+            concurrency: PRICE_CONCURRENCY,
             maxRetries: MAX_RETRIES,
             retryDelay: 2000
         };
@@ -271,7 +276,7 @@ async function executeSync() {
         }
         
         // Resumen de Precios
-        console.log(`\n   ${colors.cyan}💰 PRECIOS (Manager+ Lista 18 → Shopify):${colors.reset}`);
+        console.log(`\n   ${colors.cyan}💰 PRECIOS (Manager+ Lista 652 → Shopify):${colors.reset}`);
         if (priceResults) {
             console.log(`      ${colors.green}✅ Actualizados: ${priceResults.updated}${colors.reset}`);
             console.log(`      ${colors.blue}ℹ️  Sin cambios: ${priceResults.noChange}${colors.reset}`);
@@ -333,9 +338,10 @@ function main() {
     console.log(`   Zona horaria: ${TIMEZONE} (Santiago de Chile)`);
     console.log(`   Horarios programados:`);
     console.log(`     - ${colors.green}6:00 PM (18:00)${colors.reset} - Todos los días`);
-    console.log(`       ${colors.bright}1.${colors.reset} ${colors.cyan}📦 Sincronización de Stocks${colors.reset} (Manager+ → Shopify)`);
-    console.log(`       ${colors.bright}2.${colors.reset} ${colors.cyan}💰 Sincronización de Precios${colors.reset} (Manager+ Lista 18 → Shopify)`);
-    console.log(`   Concurrencia: ${CONCURRENCY}`);
+    console.log(`       ${colors.bright}1.${colors.reset} ${colors.cyan}📦 Sincronización de Stocks${colors.reset} (Manager+ → Shopify, Concurrencia: ${CONCURRENCY})`);
+    console.log(`       ${colors.bright}2.${colors.reset} ${colors.cyan}💰 Sincronización de Precios${colors.reset} (Manager+ Lista 652 → Shopify, Concurrencia inicial: 20)`);
+    console.log(`   Concurrencia Stocks: ${CONCURRENCY}`);
+    console.log(`   Concurrencia Precios: 20 (se reduce automáticamente si hay rate limits)`);
     console.log(`   Reintentos máximos: ${MAX_RETRIES}`);
     console.log('='.repeat(70));
     console.log(`\n${colors.yellow}💡 El scheduler está activo. Presiona Ctrl+C para detenerlo.${colors.reset}\n`);
@@ -349,8 +355,8 @@ function main() {
     });
     console.log(`${colors.green}✅ Tarea programada: 6:00 PM (18:00)${colors.reset}`);
     console.log(`\n${colors.bright}📋 Proceso de sincronización:${colors.reset}`);
-    console.log(`   ${colors.cyan}📦 Paso 1: Stocks${colors.reset} - Manager+ → Shopify`);
-    console.log(`   ${colors.cyan}💰 Paso 2: Precios${colors.reset} - Manager+ (Lista 18) → Shopify`);
+    console.log(`   ${colors.cyan}📦 Paso 1: Stocks${colors.reset} - Manager+ → Shopify (Concurrencia: ${CONCURRENCY})`);
+    console.log(`   ${colors.cyan}💰 Paso 2: Precios${colors.reset} - Manager+ (Lista 652) → Shopify (Concurrencia inicial: 20)`);
     console.log(`   ${colors.yellow}⏳ Pausa: 5 segundos entre pasos${colors.reset}`);
     
     // Mostrar próximo evento programado
