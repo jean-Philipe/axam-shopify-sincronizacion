@@ -1,7 +1,7 @@
 /**
  * Módulo de sincronización de precios entre Manager+ y Shopify
  * 
- * Este módulo obtiene los precios de productos desde Manager+ (lista 18)
+ * Este módulo obtiene los precios de productos desde Manager+ (lista 652)
  * y los sincroniza con Shopify, actualizando los valores de precio.
  */
 
@@ -203,15 +203,15 @@ async function loadAllPriceLists() {
                 // Guardar por ID
                 priceListsMap.set(listaId, productsMap);
                 
-                // También intentar mapear por nombre si el ID no es "18" pero el nombre lo sugiere
-                if (listName && (listName.includes('18') || listName.includes('Lista Precios 18'))) {
-                    if (!priceListsMap.has('18')) {
-                        priceListsMap.set('18', productsMap);
+                // También intentar mapear por nombre si el ID no es "652" pero el nombre lo sugiere
+                if (listName && (listName.includes('652') || listName.includes('Lista Precios 652'))) {
+                    if (!priceListsMap.has('652')) {
+                        priceListsMap.set('652', productsMap);
                     }
                 }
                 
-                // Log de depuración para lista 18
-                if (listaId === '18' || listName.includes('18')) {
+                // Log de depuración para lista 652
+                if (listaId === '652' || listName.includes('652')) {
                     console.log(`   Lista ${listaId} (${listName || 'sin nombre'}): ${productsMap.size} productos cargados`);
                 }
             }
@@ -224,9 +224,9 @@ async function loadAllPriceLists() {
         const totalProducts = Array.from(priceListsMap.values()).reduce((sum, map) => sum + map.size, 0);
         console.log(`✅ ${priceListsMap.size} listas de precios cargadas con ${totalProducts} productos totales`);
         
-        // Verificar que exista la lista 18
-        if (!priceListsMap.has('18')) {
-            console.warn(`⚠️  Lista de precios 18 no encontrada. Verifica que exista en Manager+.`);
+        // Verificar que exista la lista 652
+        if (!priceListsMap.has('652')) {
+            console.warn(`⚠️  Lista de precios 652 no encontrada. Verifica que exista en Manager+.`);
         }
 
         return priceListsMap;
@@ -249,7 +249,7 @@ async function loadAllPriceLists() {
 }
 
 /**
- * Obtener precio de un producto desde Manager+ (lista 18)
+ * Obtener precio de un producto desde Manager+ (lista 652)
  * 
  * @param {string} sku - Código SKU del producto
  * @param {Map<string, Map<string, number>>} priceListsMap - Mapa de listas de precios (opcional, se carga si no se proporciona)
@@ -265,15 +265,15 @@ async function getManagerProductPrice(sku, priceListsMap = null) {
             priceListsMap = await loadAllPriceLists();
         }
 
-        // Buscar en lista 18
-        const lista18 = priceListsMap.get('18');
-        if (lista18 && lista18.has(normalizedSku)) {
-            const precio = lista18.get(normalizedSku);
-            return { precio, listaUsada: '18', error: null };
+        // Buscar en lista 652
+        const lista652 = priceListsMap.get('652');
+        if (lista652 && lista652.has(normalizedSku)) {
+            const precio = lista652.get(normalizedSku);
+            return { precio, listaUsada: '652', error: null };
         }
 
-        // No encontrado en lista 18
-        return { precio: null, listaUsada: null, error: 'Sin precio en lista 18' };
+        // No encontrado en lista 652
+        return { precio: null, listaUsada: null, error: 'Sin precio en lista 652' };
         
     } catch (error) {
         if (error.response?.status === 404) {
@@ -519,7 +519,7 @@ async function syncProductPrice(sku, options = {}, shopifyProductsMap = null, pr
     const { dryRun = false, forceUpdate = false } = options;
     
     try {
-        // 1. Obtener precio de Manager+ (lista 18)
+        // 1. Obtener precio de Manager+ (lista 652)
         let managerPriceInfo;
         try {
             managerPriceInfo = await getManagerProductPrice(sku, priceListsMap);
@@ -532,14 +532,14 @@ async function syncProductPrice(sku, options = {}, shopifyProductsMap = null, pr
             };
         }
         
-        // Si no hay precio en lista 18, no actualizamos (según requerimiento)
+        // Si no hay precio en lista 652, no actualizamos (según requerimiento)
         if (!managerPriceInfo.precio) {
             return {
                 sku,
                 success: true,
                 action: 'skipped',
-                error: managerPriceInfo.error || 'Sin precio en lista 18',
-                message: 'Producto sin precio en lista 18 - no se actualiza'
+                error: managerPriceInfo.error || 'Sin precio en lista 652',
+                message: 'Producto sin precio en lista 652 - no se actualiza'
             };
         }
         
@@ -1113,8 +1113,8 @@ Opciones:
   --no-retry                Desactivar reintentos automáticos
 
 Lógica de precios:
-  - Usa lista de precios 18 de Manager+
-  - Si no tiene precio en lista 18, no se actualiza el producto en Shopify
+  - Usa lista de precios 652 de Manager+
+  - Si no tiene precio en lista 652, no se actualiza el producto en Shopify
   - Si los precios son diferentes, se actualiza el precio en Shopify
 
 Ejemplos:
