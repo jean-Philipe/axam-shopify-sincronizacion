@@ -163,6 +163,7 @@ app.get('/api/local/productos/:sku?', async (req, res) => {
  * - dryRun: Boolean para simular sin cambios
  */
 const { syncProductStock, syncMultipleProducts, syncAllProducts } = require('./syncStocks');
+const { processOrderNotification, getLastWebhook, clearLastWebhook, reprocessLastWebhook } = require('./createClientAndOrderShopify');
 
 app.post('/api/sync/stocks', async (req, res) => {
     try {
@@ -230,6 +231,159 @@ app.get('/api/sync/stocks', async (req, res) => {
 });
 
 /**
+ * Endpoint para recibir webhooks de Shopify
+ * 
+ * POST /api/webhooks/shopify
+ * 
+ * Shopify enviará notificaciones cuando ocurran eventos como:
+ * - Nuevas órdenes (order/create, order/paid, order/fulfilled)
+ */
+app.post('/api/webhooks/shopify', async (req, res) => {
+    try {
+        // Shopify envía los webhooks con un header X-Shopify-Topic
+        const topic = req.headers['x-shopify-topic'];
+        const shop = req.headers['x-shopify-shop-domain'];
+        
+        console.log(`[WEBHOOK] Webhook recibido de Shopify: ${topic || 'unknown'} desde ${shop || 'unknown'}`);
+        
+        // Extraer ID de orden para logging
+        const orderData = req.body;
+        const orderId = orderData.id?.toString() || orderData.order_id?.toString() || 'N/A';
+        
+        // Responder inmediatamente a Shopify (200 OK)
+        // Shopify requiere respuesta rápida (menos de 20 segundos)
+        res.status(200).json({ success: true, message: 'Webhook recibido' });
+        
+        // Procesar la notificación de forma asíncrona
+        setImmediate(async () => {
+            try {
+                // Procesar solo eventos de creación de orden o pago
+                if (topic === 'orders/create' || topic === 'orders/paid' || topic === 'orders/fulfilled') {
+                    const result = await processOrderNotification(orderData);
+                    // El logging detallado se hace dentro de processOrderNotification
+                } else {
+                    console.log(`[WEBHOOK] Evento ${topic} no procesado (solo procesamos orders/create, orders/paid, orders/fulfilled)`);
+                }
+            } catch (error) {
+                console.error(`[WEBHOOK] Orden Shopify ${orderId}: Error crítico - ${error.message}`);
+                if (error.stack) {
+                    console.error(`   └─ Stack: ${error.stack}`);
+                }
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ Error al procesar webhook de Shopify:', error.message);
+        // Aún así responder 200 para evitar reintentos de Shopify
+        res.status(200).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Endpoint para verificar el webhook (GET request de Shopify)
+ * 
+ * Shopify puede hacer un GET para verificar que el endpoint existe
+ */
+app.get('/api/webhooks/shopify', (req, res) => {
+    res.json({
+        success: true,
+        message: 'Webhook endpoint activo para Shopify',
+        timestamp: new Date().toISOString()
+    });
+});
+
+/**
+ * Endpoint para reprocesar el último webhook recibido
+ * 
+ * POST /api/webhooks/shopify/reprocess
+ * GET /api/webhooks/shopify/reprocess?force=true
+ * 
+ * Útil para reintentar crear cliente y orden si falló anteriormente
+ */
+app.post('/api/webhooks/shopify/reprocess', async (req, res) => {
+    try {
+        const force = req.query.force === 'true' || req.body.force === true;
+        console.log(`[REPROCESS] Reprocesando último webhook de Shopify${force ? ' (forzado)' : ''}...`);
+        const result = await reprocessLastWebhook(force);
+        
+        res.json({
+            success: result.success,
+            message: result.success ? 'Webhook reprocesado exitosamente' : 'Error al reprocesar webhook',
+            result: result
+        });
+    } catch (error) {
+        console.error(`[REPROCESS] Error: ${error.message}`);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+app.get('/api/webhooks/shopify/reprocess', async (req, res) => {
+    try {
+        const force = req.query.force === 'true';
+        console.log(`[REPROCESS] Reprocesando último webhook de Shopify${force ? ' (forzado)' : ''}...`);
+        const result = await reprocessLastWebhook(force);
+        
+        res.json({
+            success: result.success,
+            message: result.success ? 'Webhook reprocesado exitosamente' : 'Error al reprocesar webhook',
+            result: result
+        });
+    } catch (error) {
+        console.error(`[REPROCESS] Error: ${error.message}`);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Endpoint para ver información del último webhook recibido
+ * 
+ * GET /api/webhooks/shopify/last
+ */
+app.get('/api/webhooks/shopify/last', async (req, res) => {
+    const lastWebhook = getLastWebhook();
+    
+    if (!lastWebhook) {
+        return res.status(404).json({
+            success: false,
+            message: 'No hay webhook almacenado'
+        });
+    }
+    
+    const orderId = lastWebhook.id?.toString() || 
+                   lastWebhook.order_id?.toString() || 
+                   'N/A';
+    
+    res.json({
+        success: true,
+        orderId: orderId,
+        webhook: lastWebhook,
+        timestamp: new Date().toISOString()
+    });
+});
+
+/**
+ * Endpoint para limpiar el último webhook almacenado
+ * 
+ * DELETE /api/webhooks/shopify/last
+ */
+app.delete('/api/webhooks/shopify/last', async (req, res) => {
+    clearLastWebhook();
+    res.json({
+        success: true,
+        message: 'Último webhook limpiado'
+    });
+});
+
+/**
  * Endpoint de salud/health check
  * 
  * GET /health
@@ -259,7 +413,10 @@ app.get('/', (req, res) => {
         endpoints: {
             health: '/health',
             productos: '/api/local/productos/:sku?',
-            syncStocks: '/api/sync/stocks'
+            syncStocks: '/api/sync/stocks',
+            webhook: '/api/webhooks/shopify',
+            webhookReprocess: '/api/webhooks/shopify/reprocess',
+            webhookLast: '/api/webhooks/shopify/last'
         }
     });
 });
@@ -277,6 +434,10 @@ app.listen(PORT, () => {
     console.log(`   - GET /api/sync/stocks?sku=ABC123`);
     console.log(`   - GET /api/sync/stocks?all=true`);
     console.log(`   - POST /api/sync/stocks`);
+    console.log(`   - POST /api/webhooks/shopify`);
+    console.log(`   - POST/GET /api/webhooks/shopify/reprocess?force=true`);
+    console.log(`   - GET /api/webhooks/shopify/last`);
+    console.log(`   - DELETE /api/webhooks/shopify/last`);
     console.log(`\n💡 Realizando autenticación inicial con el ERP...`);
     
     // Realizar una autenticación inicial al iniciar el servidor

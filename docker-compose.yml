@@ -1,0 +1,50 @@
+# Docker Compose para API de Webhooks de Shopify
+# 
+# INSTRUCCIONES:
+# 1. Configura las variables de entorno en el archivo .env
+# 2. Ejecuta: docker-compose build
+# 3. Ejecuta: docker-compose up -d
+#
+# Para ver los logs:
+# docker-compose logs -f api
+#
+# Para detener:
+# docker-compose down
+
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: shopify-webhook-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      # Shopify - OBLIGATORIAS
+      - SHOPIFY_SHOP_DOMAIN=${SHOPIFY_SHOP_DOMAIN}
+      - SHOPIFY_ACCESS_TOKEN=${SHOPIFY_ACCESS_TOKEN}
+      
+      # ERP Manager+ - OBLIGATORIAS
+      - ERP_BASE_URL=${ERP_BASE_URL}
+      - ERP_USERNAME=${ERP_USERNAME}
+      - ERP_PASSWORD=${ERP_PASSWORD}
+      - RUT_EMPRESA=${RUT_EMPRESA}
+      
+      # Control de creación (opcional, default: false para testing)
+      - ENABLE_SHOPIFY_CREATE=${ENABLE_SHOPIFY_CREATE:-false}
+      
+      # Puerto del servidor (opcional, default: 3000)
+      - PORT=${PORT:-3000}
+      
+      # Zona horaria
+      - TZ=America/Santiago
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

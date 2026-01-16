@@ -1,0 +1,825 @@
+/**
+ * Módulo para crear clientes y órdenes en Manager+ desde webhooks de Shopify
+ * 
+ * Este módulo procesa las notificaciones de órdenes de Shopify,
+ * verifica si el cliente existe en Manager+ y crea la orden de compra/nota de venta.
+ * 
+ * IMPORTANTE: Por defecto, la creación real está DESACTIVADA para permitir testing.
+ * Activar con la variable de entorno ENABLE_SHOPIFY_CREATE=true
+ */
+
+require('dotenv').config();
+const axios = require('axios');
+const { format, addDays, subDays } = require('date-fns');
+
+// Variables de entorno
+const ERP_BASE_URL = process.env.ERP_BASE_URL;
+const ERP_USERNAME = process.env.ERP_USERNAME;
+const ERP_PASSWORD = process.env.ERP_PASSWORD;
+const RUT_EMPRESA = process.env.RUT_EMPRESA;
+const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN;
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+
+// Flag para habilitar/deshabilitar creación real en Manager
+// Por defecto desactivado para testing de webhooks
+const ENABLE_SHOPIFY_CREATE = process.env.ENABLE_SHOPIFY_CREATE === 'true' || process.env.ENABLE_SHOPIFY_CREATE === '1';
+
+// Variable para almacenar el token de autenticación del ERP
+let erpAuthToken = null;
+let erpTokenExpirationTime = null;
+
+// Órdenes ya procesadas (idempotencia simple en memoria)
+const processedOrders = new Set();
+
+// Almacenar el último webhook recibido para poder reprocesarlo
+let lastWebhookNotification = null;
+
+/**
+ * Calcular dígito verificador chileno (módulo 11) para un RUT dado en números
+ * @param {string} rutBase - RUT sin dígito verificador, solo dígitos
+ * @returns {string} Dígito verificador (0-9 o K)
+ */
+function calcularDV(rutBase) {
+    const clean = (rutBase || '').replace(/\D/g, '');
+    if (!clean) return '0';
+
+    let suma = 0;
+    let multiplicador = 2;
+
+    for (let i = clean.length - 1; i >= 0; i--) {
+        suma += parseInt(clean[i], 10) * multiplicador;
+        multiplicador = multiplicador === 7 ? 2 : multiplicador + 1;
+    }
+
+    const resto = suma % 11;
+    const dv = 11 - resto;
+
+    if (dv === 11) return '0';
+    if (dv === 10) return 'K';
+    return dv.toString();
+}
+
+/**
+ * Formatear RUT chileno (agregar puntos y guión si no los tiene)
+ * @param {string} rut - RUT en cualquier formato
+ * @returns {string} RUT formateado
+ */
+function formatRut(rut) {
+    if (!rut) return null;
+    
+    // Limpiar el RUT
+    const clean = rut.toString().replace(/[.\s-]/g, '').toUpperCase();
+    
+    // Separar número y dígito verificador
+    const match = clean.match(/^(\d{7,9})([0-9K])$/);
+    if (!match) return clean; // Retornar como está si no coincide con el formato esperado
+    
+    const [, numero, dv] = match;
+    
+    // Agregar puntos al número
+    const formatted = numero.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    
+    return `${formatted}-${dv}`;
+}
+
+/**
+ * Autenticarse con el ERP Manager+
+ */
+async function authenticateWithERP() {
+    try {
+        const response = await axios.post(`${ERP_BASE_URL}/auth/`, {
+            username: ERP_USERNAME,
+            password: ERP_PASSWORD
+        }, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+
+        erpAuthToken = response.data.auth_token;
+        erpTokenExpirationTime = Date.now() + (60 * 60 * 1000); // 1 hora
+        
+        return erpAuthToken;
+    } catch (error) {
+        console.error('[ERP] Error en autenticación:', error.response?.data?.message || error.message);
+        throw new Error('Error al autenticarse con el ERP: ' + (error.response?.data?.message || error.message));
+    }
+}
+
+/**
+ * Obtener el token de autenticación del ERP (con caché)
+ */
+async function getERPAuthToken() {
+    if (erpAuthToken && erpTokenExpirationTime && Date.now() < erpTokenExpirationTime) {
+        return erpAuthToken;
+    }
+    return await authenticateWithERP();
+}
+
+/**
+ * Obtener información completa de una orden de Shopify
+ *
+ * @param {string} orderId - ID de la orden en Shopify
+ * @returns {Promise<Object>} Información completa de la orden
+ */
+async function getShopifyOrder(orderId) {
+    try {
+        const shopName = SHOPIFY_SHOP_DOMAIN?.replace('.myshopify.com', '');
+        const url = `https://${shopName}.myshopify.com/admin/api/2024-01/orders/${orderId}.json`;
+        
+        const response = await axios.get(url, {
+            headers: {
+                'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        return response.data.order;
+    } catch (error) {
+        const errorMsg = error.response?.data?.errors || error.message;
+        console.error(`[SHOPIFY] Error al obtener orden ${orderId}: ${errorMsg}`);
+        throw error;
+    }
+}
+
+/**
+ * Obtener comunas desde Manager+
+ */
+async function getComunas() {
+    try {
+        const token = await getERPAuthToken();
+        const response = await axios.get(`${ERP_BASE_URL}/tabla-gral/comunas`, {
+            headers: {
+                'Authorization': `Token ${token}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        return response.data.data || [];
+    } catch (error) {
+        return [];
+    }
+}
+
+/**
+ * Mapear región de Shopify a código de región de Manager+
+ */
+function mapRegionToCode(regionName) {
+    const regiones = [
+        { code: "1", regionCode: "TA", name: "Tarapacá" },
+        { code: "2", regionCode: "AN", name: "Antofagasta" },
+        { code: "3", regionCode: "AT", name: "Atacama" },
+        { code: "4", regionCode: "CO", name: "Coquimbo" },
+        { code: "5", regionCode: "VS", name: "Valparaíso" },
+        { code: "6", regionCode: "LI", name: "Libertador General Bernardo O'Higgins" },
+        { code: "7", regionCode: "ML", name: "Maule" },
+        { code: "8", regionCode: "BI", name: "Biobío" },
+        { code: "9", regionCode: "AR", name: "Araucanía" },
+        { code: "10", regionCode: "LL", name: "Los Lagos" },
+        { code: "11", regionCode: "AI", name: "Aysén" },
+        { code: "12", regionCode: "MA", name: "Magallanes" },
+        { code: "13", regionCode: "RM", name: "Metropolitana" },
+        { code: "14", regionCode: "LR", name: "Los Ríos" },
+        { code: "15", regionCode: "AP", name: "Arica y Parinacota" },
+        { code: "16", regionCode: "NB", name: "Ñuble" }
+    ];
+
+    const region = regiones.find(r => 
+        r.name.toLowerCase().includes(regionName?.toLowerCase() || '') ||
+        regionName?.toLowerCase().includes(r.name.toLowerCase() || '') ||
+        r.regionCode.toLowerCase() === regionName?.toLowerCase()
+    );
+
+    return region ? region.code : "13"; // Default: RM
+}
+
+/**
+ * Verificar si un cliente existe en el ERP
+ * 
+ * @param {string} rutCliente - RUT del cliente a verificar
+ * @returns {Promise<boolean>} true si existe, false si no existe
+ */
+async function checkClientExists(rutCliente) {
+    try {
+        const token = await getERPAuthToken();
+        const endpoint = `${ERP_BASE_URL}/clients/${RUT_EMPRESA}/?rut_cliente=${rutCliente}`;
+        
+        try {
+            const response = await axios.get(endpoint, {
+                headers: {
+                    'Authorization': `Token ${token}`,
+                    'Content-Type': 'application/json'
+                },
+                validateStatus: (status) => status < 500
+            });
+            
+            if (response.status >= 200 && response.status < 300) {
+                const data = response.data?.data || response.data;
+                
+                if (response.data?.retorno === false) {
+                    return false;
+                }
+                
+                if (Array.isArray(data) && data.length > 0) {
+                    const clienteEncontrado = data.find(c => 
+                        c.rut_cliente === rutCliente || 
+                        c.rut === rutCliente ||
+                        (c.rut_cliente && c.rut_cliente.replace(/[.\s-]/g, '') === rutCliente.replace(/[.\s-]/g, ''))
+                    );
+                    return !!clienteEncontrado;
+                }
+                
+                if (data && typeof data === 'object' && !Array.isArray(data)) {
+                    const rutEncontrado = data.rut_cliente || data.rut;
+                    if (rutEncontrado && rutEncontrado.replace(/[.\s-]/g, '') === rutCliente.replace(/[.\s-]/g, '')) {
+                        return true;
+                    }
+                }
+            }
+        } catch (endpointError) {
+            // Continuar si el endpoint no existe
+        }
+        
+        return false;
+    } catch (error) {
+        return false;
+    }
+}
+
+/**
+ * Crear cliente en Manager+ desde datos de orden de Shopify
+ * 
+ * @param {Object} orderData - Datos completos de la orden de Shopify
+ * @returns {Promise<Object>} Información del cliente creado
+ */
+async function createClient(orderData) {
+    if (!ENABLE_SHOPIFY_CREATE) {
+        console.log('   └─ [TESTING] Creación de cliente DESACTIVADA (ENABLE_SHOPIFY_CREATE=false)');
+        return { 
+            cliente: { rut_cliente: orderData.billing_address?.company || '11111111-1' },
+            direccionNombre: 'Direccion Shopify',
+            created: false,
+            testing: true
+        };
+    }
+
+    try {
+        const token = await getERPAuthToken();
+        const comunas = await getComunas();
+        
+        // Extraer datos del cliente desde la orden de Shopify
+        const billingAddress = orderData.billing_address || {};
+        const shippingAddress = orderData.shipping_address || billingAddress;
+        const customer = orderData.customer || {};
+        
+        // Buscar atributos personalizados (note_attributes)
+        const noteAttributes = orderData.note_attributes || [];
+        const rutAttr = noteAttributes.find(attr => attr.name === 'Rut');
+        const razonSocialAttr = noteAttributes.find(attr => attr.name === 'Razón social');
+        const giroAttr = noteAttributes.find(attr => attr.name === 'Giro');
+        const emailAttr = noteAttributes.find(attr => attr.name === 'Email');
+        const direccionAttr = noteAttributes.find(attr => attr.name === 'Dirección de facturación');
+        const regionAttr = noteAttributes.find(attr => attr.name === 'Región');
+        const comunaAttr = noteAttributes.find(attr => attr.name === 'Comuna');
+        const ciudadAttr = noteAttributes.find(attr => attr.name === 'Ciudad');
+        const telefonoAttr = noteAttributes.find(attr => attr.name === 'Recibe-Teléfono');
+        
+        // Determinar si es factura o boleta
+        const boletaFactura = noteAttributes.find(attr => attr.name === 'Boleta/Factura');
+        const isFactura = boletaFactura?.value === 'Factura';
+        
+        // Obtener nombre y apellido según el tipo de documento
+        let nombreAttr, apellidoAttr;
+        if (isFactura) {
+            nombreAttr = noteAttributes.find(attr => attr.name === 'Nombre de quien realiza el pedido');
+            apellidoAttr = noteAttributes.find(attr => attr.name === 'Apellido de quien realiza el pedido');
+        } else {
+            nombreAttr = noteAttributes.find(attr => attr.name === 'Nombre');
+            apellidoAttr = noteAttributes.find(attr => attr.name === 'Apellido');
+        }
+        
+        // Obtener datos de dirección
+        const direccion = direccionAttr?.value || 
+                         (shippingAddress.address1 ? `${shippingAddress.address1}${shippingAddress.address2 ? ', ' + shippingAddress.address2 : ''}` : '') ||
+                         billingAddress.address1 || '';
+        const ciudad = ciudadAttr?.value || shippingAddress.city || billingAddress.city || '';
+        const region = regionAttr?.value || shippingAddress.province || billingAddress.province || '';
+        const comunaName = comunaAttr?.value || ciudad;
+        
+        // Buscar comuna en la lista
+        const comuna = comunas.find(c => 
+            c.name?.toLowerCase() === comunaName?.toLowerCase() ||
+            c.name?.toLowerCase() === ciudad?.toLowerCase()
+        ) || comunas[0]; // Fallback: primera comuna
+        
+        const codComuna = comuna ? (comuna.cod_comuna || comuna.code_ext || comuna.code || '.') : '.';
+        const codCiudad = mapRegionToCode(region);
+        
+        // RUT del cliente
+        let rutCliente = rutAttr?.value || billingAddress.company || customer.default_address?.company || '11111111-1';
+        if (!rutCliente.includes('-')) {
+            // Si no tiene DV, calcularlo
+            const rutBase = rutCliente.replace(/\D/g, '');
+            rutCliente = formatRut(rutBase) || rutCliente;
+        }
+        
+        // Razón social
+        const razonSocial = razonSocialAttr?.value || 
+                           billingAddress.name?.toUpperCase() || 
+                           customer.default_address?.name?.toUpperCase() || 
+                           'Cliente Shopify';
+        
+        // Email
+        const email = emailAttr?.value || customer.email || orderData.email || '';
+        
+        // Teléfono
+        const telefono = telefonoAttr?.value || 
+                        billingAddress.phone || 
+                        shippingAddress.phone || 
+                        customer.default_address?.phone || '';
+        
+        // Giro
+        const giro = giroAttr?.value || (isFactura ? 'Comercio' : 'Persona Natural');
+        
+        // Verificar si el cliente ya existe
+        const clienteExiste = await checkClientExists(rutCliente);
+        if (clienteExiste) {
+            console.log(`   └─ Cliente ${rutCliente} ya existe en Manager+`);
+            return {
+                cliente: { rut_cliente: rutCliente },
+                direccionNombre: 'Direccion Shopify',
+                created: false,
+                existing: true
+            };
+        }
+        
+        // Preparar datos del cliente
+        const infoCliente = {
+            rut_empresa: RUT_EMPRESA,
+            rut_cliente: rutCliente,
+            razon_social: razonSocial.slice(0, 50),
+            nom_fantasia: razonSocial.slice(0, 50),
+            giro: giro.slice(0, 50),
+            holding: "",
+            area_prod: "",
+            clasif: "A5",
+            email: email,
+            emailsii: email,
+            comentario: `Cliente creado desde Shopify, Ciudad: ${ciudad || 'No se indica'}`,
+            tipo: "C",
+            tipo_prov: "N",
+            vencimiento: "01",
+            plazo_pago: "01",
+            cod_vendedor: ERP_USERNAME,
+            cod_comis: ERP_USERNAME,
+            cod_cobrador: "",
+            lista_precio: "18",
+            comen_emp: "",
+            descrip_dir: "Direccion Shopify",
+            direccion: direccion.slice(0, 70),
+            cod_comuna: codComuna,
+            cod_ciudad: codCiudad,
+            atencion: ".",
+            emailconta: email,
+            telefono: telefono || ".",
+            fax: "",
+            cta_banco: "",
+            cta_tipo: "",
+            cta_corr: "",
+            id_ext: "",
+            texto1: "",
+            texto2: "",
+            caract1: "",
+            caract2: ""
+        };
+        
+        // Crear cliente en Manager+
+        const response = await axios.post(
+            `${ERP_BASE_URL}/import/create-client/?sobreescribir=S`,
+            infoCliente,
+            {
+                headers: {
+                    'Authorization': `Token ${token}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        console.log(`   └─ Cliente ${rutCliente} creado exitosamente en Manager+`);
+        
+        return {
+            cliente: { rut_cliente: rutCliente },
+            direccionNombre: 'Direccion Shopify',
+            created: true,
+            data: response.data
+        };
+        
+    } catch (error) {
+        const errorMsg = error.response?.data?.mensaje || error.response?.data?.message || error.message;
+        console.error(`   └─ Error al crear cliente: ${errorMsg}`);
+        throw error;
+    }
+}
+
+/**
+ * Obtener el último folio de Nota de Venta
+ * @returns {Promise<number>} Último folio
+ */
+async function getFolio() {
+    try {
+        const token = await getERPAuthToken();
+        const fechaHoy = new Date();
+        const fechaTomorrow = format(addDays(fechaHoy, 1), "yyyyMMdd");
+        const fechaAnterior = format(subDays(fechaHoy, 3), "yyyyMMdd");
+        
+        const endpoint = `documents/${RUT_EMPRESA}/NV/V/?df=${fechaAnterior}&dt=${fechaTomorrow}`;
+        
+        const response = await axios.get(`${ERP_BASE_URL}/${endpoint}`, {
+            headers: {
+                'Authorization': `Token ${token}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        const documentos = response.data.data || [];
+        
+        let maxFolio = -Infinity;
+        documentos.forEach((documento) => {
+            if (documento.folio > maxFolio) {
+                maxFolio = documento.folio;
+            }
+        });
+        
+        return maxFolio === -Infinity ? 0 : maxFolio;
+    } catch (error) {
+        console.error('Error al obtener folio:', error.message);
+        return 0;
+    }
+}
+
+/**
+ * Validar unidad de producto en Manager+
+ * @param {string} sku - SKU del producto
+ * @returns {Promise<string>} Unidad del producto
+ */
+async function validateProductUnit(sku) {
+    try {
+        const token = await getERPAuthToken();
+        const response = await axios.get(
+            `${ERP_BASE_URL}/products/${RUT_EMPRESA}/${sku}`,
+            {
+                headers: {
+                    'Authorization': `Token ${token}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        const unidad = response.data.data[0]?.unidadstock || 'UMS';
+        return unidad;
+    } catch (error) {
+        console.error(`Error al validar unidad del producto ${sku}:`, error.message);
+        return 'UMS'; // Unidad por defecto
+    }
+}
+
+/**
+ * Crear orden (Nota de Venta) en Manager+ desde datos de orden de Shopify
+ * 
+ * @param {Object} orderData - Datos completos de la orden de Shopify
+ * @param {Object} clienteInfo - Información del cliente creado
+ * @returns {Promise<Object>} Resultado de la creación
+ */
+async function createOrder(orderData, clienteInfo) {
+    if (!ENABLE_SHOPIFY_CREATE) {
+        console.log('   └─ [TESTING] Creación de orden DESACTIVADA (ENABLE_SHOPIFY_CREATE=false)');
+        return {
+            success: true,
+            data: { mensaje: 'Orden simulada (testing)' },
+            orden: { num_doc: 'TEST', tipodocumento: 'NV' },
+            testing: true
+        };
+    }
+
+    try {
+        const token = await getERPAuthToken();
+        
+        // Crear cliente primero
+        await createClient(orderData);
+        
+        // Obtener folio
+        const maxFolio = await getFolio();
+        
+        // Preparar detalles de la orden
+        const detalles = [];
+        
+        // Procesar items de la orden
+        for (const item of orderData.line_items || []) {
+            const unidad = await validateProductUnit(item.sku);
+            
+            const detalle = {
+                cod_producto: item.sku,
+                cantidad: item.quantity.toString(),
+                unidad: unidad,
+                precio_unit: `${Math.round(item.price / 1.19)}`,
+                moneda_det: "CLP",
+                tasa_cambio_det: "1",
+                nro_serie: "",
+                num_lote: "",
+                fecha_vec: "",
+                cen_cos: "A03",
+                tipo_desc: "",
+                descuento: "",
+                ubicacion: "",
+                bodega: "",
+                concepto1: "Venta",
+                concepto2: "",
+                concepto3: "",
+                concepto4: "",
+                descrip: item.title,
+                desc_adic: "",
+                stock: "0",
+                cod_impesp1: "",
+                mon_impesp1: "",
+                cod_impesp2: "",
+                mon_impesp2: "",
+                fecha_comp: "",
+                porc_retencion: ""
+            };
+            
+            detalles.push(detalle);
+        }
+        
+        // Agregar costo de envío si existe
+        if (orderData.shipping_lines && orderData.shipping_lines.length > 0 && orderData.shipping_lines[0].price > 0) {
+            const shipping = orderData.shipping_lines[0];
+            const despacho = {
+                cod_producto: "DPCHO",
+                cantidad: "1",
+                unidad: "UMS",
+                precio_unit: `${Math.round(shipping.price / 1.19)}`,
+                moneda_det: "CLP",
+                tasa_cambio_det: "1",
+                nro_serie: "",
+                num_lote: "",
+                fecha_vec: "",
+                cen_cos: "A03",
+                tipo_desc: "",
+                descuento: "",
+                ubicacion: "",
+                bodega: "",
+                concepto1: "Venta",
+                concepto2: "",
+                concepto3: "",
+                concepto4: "",
+                descrip: "DESPACHO e-commerce",
+                desc_adic: "",
+                stock: "0",
+                cod_impesp1: "",
+                mon_impesp1: "",
+                cod_impesp2: "",
+                mon_impesp2: "",
+                fecha_comp: "",
+                porc_retencion: ""
+            };
+            detalles.push(despacho);
+        }
+        
+        // Obtener datos adicionales
+        const noteAttributes = orderData.note_attributes || [];
+        const nombreAttr = noteAttributes.find(attr => attr.name === 'Nombre') || 
+                          noteAttributes.find(attr => attr.name === 'Nombre de quien realiza el pedido');
+        const apellidoAttr = noteAttributes.find(attr => attr.name === 'Apellido') || 
+                            noteAttributes.find(attr => attr.name === 'Apellido de quien realiza el pedido');
+        const telefonoAttr = noteAttributes.find(attr => attr.name === 'Recibe-Teléfono');
+        
+        const nombre = nombreAttr?.value || '';
+        const apellido = apellidoAttr?.value || '';
+        const telefono = telefonoAttr?.value || orderData.billing_address?.phone || '';
+        const notes = orderData.note || '';
+        
+        // Fecha actual
+        const fechaHoy = format(new Date(), "dd/MM/yyyy");
+        
+        // Calcular totales
+        const totalPrice = parseFloat(orderData.total_price || 0);
+        const totalDiscounts = parseFloat(orderData.total_discounts || 0);
+        const afecto = Math.round((totalPrice - totalDiscounts) / 1.19);
+        const iva = Math.round(afecto * 0.19);
+        
+        // Preparar glosa
+        const glosaParts = [
+            'Shopify',
+            nombre && apellido ? `${nombre} ${apellido}` : '',
+            telefono ? `Tel: ${telefono}` : '',
+            notes ? `Notas: ${notes}` : '',
+            `Referencia: ${orderData.checkout_id || orderData.order_number || ''}`
+        ].filter(Boolean);
+        const glosa = glosaParts.join('; ').slice(0, 100);
+        
+        // Preparar información de la orden
+        const infoOrder = {
+            rut_empresa: RUT_EMPRESA,
+            tipodocumento: "NV",
+            num_doc: (maxFolio + 1).toString(),
+            fecha_doc: fechaHoy,
+            fecha_ref: "",
+            fecha_vcto: fechaHoy,
+            modalidad: "N",
+            cod_unidnegocio: "UNEG-001",
+            rut_cliente: clienteInfo.cliente.rut_cliente,
+            dire_cliente: "Direccion Shopify",
+            rut_facturador: "",
+            cod_vendedor: ERP_USERNAME,
+            cod_comisionista: ERP_USERNAME,
+            lista_precio: "18",
+            plazo_pago: "01",
+            cod_moneda: "CLP",
+            tasa_cambio: "1",
+            afecto: afecto.toString(),
+            exento: "0",
+            iva: iva.toString(),
+            imp_esp: "",
+            iva_ret: "",
+            imp_ret: "",
+            tipo_desc_global: "M",
+            monto_desc_global: `${Math.round(totalDiscounts / 1.19)}`,
+            total: totalPrice.toString(),
+            deuda_pendiente: "0",
+            glosa: glosa,
+            ajuste_iva: "0",
+            detalles: detalles
+        };
+        
+        // Crear orden en Manager+
+        const response = await axios.post(
+            `${ERP_BASE_URL}/import/create-document/?emitir=N&docnumreg=N`,
+            infoOrder,
+            {
+                headers: {
+                    'Authorization': `Token ${token}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        console.log(`   └─ Orden ${infoOrder.num_doc} creada exitosamente en Manager+`);
+        
+        return {
+            success: true,
+            data: response.data,
+            orden: infoOrder
+        };
+        
+    } catch (error) {
+        const errorDetails = error.response?.data || {};
+        const errorMsg = errorDetails.mensaje || errorDetails.message || error.message;
+        console.error(`   └─ Error al crear orden: ${errorMsg}`);
+        throw error;
+    }
+}
+
+/**
+ * Procesar notificación de orden de Shopify
+ * 
+ * @param {Object} orderData - Datos de la orden de Shopify del webhook
+ * @returns {Promise<Object>} Resultado del procesamiento
+ */
+async function processOrderNotification(orderData) {
+    // Almacenar el último webhook recibido
+    lastWebhookNotification = JSON.parse(JSON.stringify(orderData));
+    
+    // Extraer ID de orden
+    const orderId = orderData.id?.toString() || orderData.order_id?.toString() || '';
+    
+    if (!orderId) {
+        console.error('[ERROR] No se encontró ID de orden en la notificación de Shopify');
+        return { success: false, error: 'ID de orden no encontrado' };
+    }
+    
+    // Idempotencia: evitar reprocesar la misma orden múltiples veces
+    if (processedOrders.has(orderId)) {
+        console.log(`[SKIP] Orden Shopify ${orderId}: Ya procesada anteriormente`);
+        return {
+            success: true,
+            skipped: true,
+            reason: 'order_already_processed',
+            orderId
+        };
+    }
+    processedOrders.add(orderId);
+    
+    console.log(`[PROCESO] Orden Shopify ${orderId}: Iniciando procesamiento...`);
+    
+    // Validaciones previas
+    if (!ERP_BASE_URL || !ERP_USERNAME || !ERP_PASSWORD || !RUT_EMPRESA) {
+        console.error(`[ERROR] Orden ${orderId}: Variables de entorno del ERP incompletas`);
+        return { success: false, error: 'Configuración incompleta: Variables del ERP no definidas' };
+    }
+    
+    // Verificar si la creación está habilitada
+    if (!ENABLE_SHOPIFY_CREATE) {
+        console.log(`[TESTING] Orden ${orderId}: Creación DESACTIVADA - Solo recibiendo webhook`);
+        console.log(`   └─ Para activar creación, configurar ENABLE_SHOPIFY_CREATE=true en .env`);
+        return {
+            success: true,
+            orderId,
+            testing: true,
+            message: 'Webhook recibido correctamente. Creación desactivada.',
+            orderData: orderData
+        };
+    }
+    
+    try {
+        // Obtener información completa de la orden desde Shopify (si no está completa en el webhook)
+        let orderDataComplete = orderData;
+        if (!orderData.line_items || orderData.line_items.length === 0) {
+            orderDataComplete = await getShopifyOrder(orderId);
+        }
+        
+        // Validar que tenemos datos básicos de la orden
+        if (!orderDataComplete || !orderDataComplete.customer) {
+            console.error(`[ERROR] Orden ${orderId}: Datos de orden incompletos`);
+            return { success: false, error: 'Datos de orden incompletos desde Shopify' };
+        }
+        
+        // Crear cliente
+        console.log(`   └─ Creando cliente...`);
+        const clienteInfo = await createClient(orderDataComplete);
+        
+        // Crear orden
+        console.log(`   └─ Creando orden...`);
+        const ordenResult = await createOrder(orderDataComplete, clienteInfo);
+        
+        console.log(`[RESUMEN] Orden Shopify ${orderId}: ✅ COMPLETADA - Cliente y Orden creados exitosamente\n`);
+        
+        return {
+            success: true,
+            orderId,
+            cliente: clienteInfo,
+            orden: ordenResult
+        };
+        
+    } catch (error) {
+        const errorMsg = error.response?.data?.message || error.response?.data?.mensaje || error.message;
+        console.error(`[ERROR] Orden Shopify ${orderId}: ${errorMsg}`);
+        console.log(''); // Línea en blanco para separar
+        
+        return {
+            success: false,
+            error: errorMsg,
+            orderId
+        };
+    }
+}
+
+/**
+ * Obtener el último webhook recibido
+ * @returns {Object|null} Último webhook o null si no hay ninguno
+ */
+function getLastWebhook() {
+    return lastWebhookNotification;
+}
+
+/**
+ * Limpiar el último webhook almacenado
+ */
+function clearLastWebhook() {
+    lastWebhookNotification = null;
+}
+
+/**
+ * Reprocesar el último webhook recibido
+ * @param {boolean} force - Si es true, fuerza el reprocesamiento incluso si ya fue procesado
+ * @returns {Promise<Object>} Resultado del procesamiento
+ */
+async function reprocessLastWebhook(force = false) {
+    if (!lastWebhookNotification) {
+        return {
+            success: false,
+            error: 'No hay webhook almacenado para reprocesar'
+        };
+    }
+    
+    const orderId = lastWebhookNotification.id?.toString() || 
+                   lastWebhookNotification.order_id?.toString() || 
+                   'N/A';
+    
+    if (force) {
+        // Remover de processedOrders para permitir reprocesamiento
+        processedOrders.delete(orderId);
+    }
+    
+    return await processOrderNotification(lastWebhookNotification);
+}
+
+// Exportar funciones
+module.exports = {
+    processOrderNotification,
+    createClient,
+    createOrder,
+    getShopifyOrder,
+    getLastWebhook,
+    clearLastWebhook,
+    reprocessLastWebhook,
+    checkClientExists
+};

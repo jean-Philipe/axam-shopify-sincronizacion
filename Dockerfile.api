@@ -1,0 +1,26 @@
+# Dockerfile para API Express de Shopify (webhook + endpoints HTTP)
+FROM node:18-alpine
+
+# Instalar tzdata para manejo de zonas horarias
+RUN apk add --no-cache tzdata
+
+# Establecer zona horaria
+ENV TZ=America/Santiago
+
+# Crear directorio de trabajo
+WORKDIR /app
+
+# Copiar archivos de dependencias
+COPY package*.json ./
+
+# Instalar dependencias (solo producción)
+RUN npm install --omit=dev
+
+# Copiar código de la aplicación
+COPY . .
+
+# Exponer puerto de la API (configurable por env PORT, default 3000 en server.js)
+EXPOSE 3000
+
+# Comando de arranque: API Express
+CMD ["node", "server.js"]
