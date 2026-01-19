@@ -11,6 +11,50 @@
 require('dotenv').config();
 const axios = require('axios');
 const { format, addDays, subDays } = require('date-fns');
+const { serializeError, delay, getTimestamp } = require('./webhookQueue');
+
+// Configuración de retry
+const RETRY_CONFIG = {
+    maxRetries: 5,
+    baseDelay: 3000,
+    maxDelay: 60000,
+    retryableStatuses: [429, 500, 502, 503, 504]
+};
+
+/**
+ * Wrapper de axios con retry automático para errores de rate limit y servidor
+ * @param {Function} requestFn - Función que retorna la promesa de axios
+ * @param {string} operationName - Nombre de la operación para logging
+ * @returns {Promise<any>} Respuesta de axios
+ */
+async function axiosWithRetry(requestFn, operationName = 'petición') {
+    let lastError;
+
+    for (let attempt = 1; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+        try {
+            const response = await requestFn();
+            return response;
+        } catch (error) {
+            lastError = error;
+            const status = error.response?.status;
+            const isRetryable = RETRY_CONFIG.retryableStatuses.includes(status);
+
+            if (!isRetryable || attempt === RETRY_CONFIG.maxRetries) {
+                throw error;
+            }
+
+            const delayMs = Math.min(
+                RETRY_CONFIG.baseDelay * Math.pow(2, attempt - 1),
+                RETRY_CONFIG.maxDelay
+            );
+
+            console.log(`[${getTimestamp()}] ⏳ ${operationName}: Error ${status}, reintento ${attempt}/${RETRY_CONFIG.maxRetries} en ${delayMs / 1000}s...`);
+            await delay(delayMs);
+        }
+    }
+
+    throw lastError;
+}
 
 // Variables de entorno
 const ERP_BASE_URL = process.env.ERP_BASE_URL;
@@ -66,19 +110,19 @@ function calcularDV(rutBase) {
  */
 function formatRut(rut) {
     if (!rut) return null;
-    
+
     // Limpiar el RUT
     const clean = rut.toString().replace(/[.\s-]/g, '').toUpperCase();
-    
+
     // Separar número y dígito verificador
     const match = clean.match(/^(\d{7,9})([0-9K])$/);
     if (!match) return clean; // Retornar como está si no coincide con el formato esperado
-    
+
     const [, numero, dv] = match;
-    
+
     // Agregar puntos al número
     const formatted = numero.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
-    
+
     return `${formatted}-${dv}`;
 }
 
@@ -98,7 +142,7 @@ async function authenticateWithERP() {
 
         erpAuthToken = response.data.auth_token;
         erpTokenExpirationTime = Date.now() + (60 * 60 * 1000); // 1 hora
-        
+
         return erpAuthToken;
     } catch (error) {
         console.error('[ERP] Error en autenticación:', error.response?.data?.message || error.message);
@@ -126,14 +170,14 @@ async function getShopifyOrder(orderId) {
     try {
         const shopName = SHOPIFY_SHOP_DOMAIN?.replace('.myshopify.com', '');
         const url = `https://${shopName}.myshopify.com/admin/api/2024-01/orders/${orderId}.json`;
-        
+
         const response = await axios.get(url, {
             headers: {
                 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
                 'Content-Type': 'application/json'
             }
         });
-        
+
         return response.data.order;
     } catch (error) {
         const errorMsg = error.response?.data?.errors || error.message;
@@ -183,7 +227,7 @@ function mapRegionToCode(regionName) {
         { code: "16", regionCode: "NB", name: "Ñuble" }
     ];
 
-    const region = regiones.find(r => 
+    const region = regiones.find(r =>
         r.name.toLowerCase().includes(regionName?.toLowerCase() || '') ||
         regionName?.toLowerCase().includes(r.name.toLowerCase() || '') ||
         r.regionCode.toLowerCase() === regionName?.toLowerCase()
@@ -202,7 +246,7 @@ async function checkClientExists(rutCliente) {
     try {
         const token = await getERPAuthToken();
         const endpoint = `${ERP_BASE_URL}/clients/${RUT_EMPRESA}/?rut_cliente=${rutCliente}`;
-        
+
         try {
             const response = await axios.get(endpoint, {
                 headers: {
@@ -211,23 +255,23 @@ async function checkClientExists(rutCliente) {
                 },
                 validateStatus: (status) => status < 500
             });
-            
+
             if (response.status >= 200 && response.status < 300) {
                 const data = response.data?.data || response.data;
-                
+
                 if (response.data?.retorno === false) {
                     return false;
                 }
-                
+
                 if (Array.isArray(data) && data.length > 0) {
-                    const clienteEncontrado = data.find(c => 
-                        c.rut_cliente === rutCliente || 
+                    const clienteEncontrado = data.find(c =>
+                        c.rut_cliente === rutCliente ||
                         c.rut === rutCliente ||
                         (c.rut_cliente && c.rut_cliente.replace(/[.\s-]/g, '') === rutCliente.replace(/[.\s-]/g, ''))
                     );
                     return !!clienteEncontrado;
                 }
-                
+
                 if (data && typeof data === 'object' && !Array.isArray(data)) {
                     const rutEncontrado = data.rut_cliente || data.rut;
                     if (rutEncontrado && rutEncontrado.replace(/[.\s-]/g, '') === rutCliente.replace(/[.\s-]/g, '')) {
@@ -238,7 +282,7 @@ async function checkClientExists(rutCliente) {
         } catch (endpointError) {
             // Continuar si el endpoint no existe
         }
-        
+
         return false;
     } catch (error) {
         return false;
@@ -254,7 +298,7 @@ async function checkClientExists(rutCliente) {
 async function createClient(orderData) {
     if (!ENABLE_SHOPIFY_CREATE) {
         console.log('   └─ [TESTING] Creación de cliente DESACTIVADA (ENABLE_SHOPIFY_CREATE=false)');
-        return { 
+        return {
             cliente: { rut_cliente: orderData.billing_address?.company || '11111111-1' },
             direccionNombre: 'Direccion Shopify',
             created: false,
@@ -265,12 +309,12 @@ async function createClient(orderData) {
     try {
         const token = await getERPAuthToken();
         const comunas = await getComunas();
-        
+
         // Extraer datos del cliente desde la orden de Shopify
         const billingAddress = orderData.billing_address || {};
         const shippingAddress = orderData.shipping_address || billingAddress;
         const customer = orderData.customer || {};
-        
+
         // Buscar atributos personalizados (note_attributes)
         const noteAttributes = orderData.note_attributes || [];
         const rutAttr = noteAttributes.find(attr => attr.name === 'Rut');
@@ -282,11 +326,11 @@ async function createClient(orderData) {
         const comunaAttr = noteAttributes.find(attr => attr.name === 'Comuna');
         const ciudadAttr = noteAttributes.find(attr => attr.name === 'Ciudad');
         const telefonoAttr = noteAttributes.find(attr => attr.name === 'Recibe-Teléfono');
-        
+
         // Determinar si es factura o boleta
         const boletaFactura = noteAttributes.find(attr => attr.name === 'Boleta/Factura');
         const isFactura = boletaFactura?.value === 'Factura';
-        
+
         // Obtener nombre y apellido según el tipo de documento
         let nombreAttr, apellidoAttr;
         if (isFactura) {
@@ -296,24 +340,24 @@ async function createClient(orderData) {
             nombreAttr = noteAttributes.find(attr => attr.name === 'Nombre');
             apellidoAttr = noteAttributes.find(attr => attr.name === 'Apellido');
         }
-        
+
         // Obtener datos de dirección
-        const direccion = direccionAttr?.value || 
-                         (shippingAddress.address1 ? `${shippingAddress.address1}${shippingAddress.address2 ? ', ' + shippingAddress.address2 : ''}` : '') ||
-                         billingAddress.address1 || '';
+        const direccion = direccionAttr?.value ||
+            (shippingAddress.address1 ? `${shippingAddress.address1}${shippingAddress.address2 ? ', ' + shippingAddress.address2 : ''}` : '') ||
+            billingAddress.address1 || '';
         const ciudad = ciudadAttr?.value || shippingAddress.city || billingAddress.city || '';
         const region = regionAttr?.value || shippingAddress.province || billingAddress.province || '';
         const comunaName = comunaAttr?.value || ciudad;
-        
+
         // Buscar comuna en la lista
-        const comuna = comunas.find(c => 
+        const comuna = comunas.find(c =>
             c.name?.toLowerCase() === comunaName?.toLowerCase() ||
             c.name?.toLowerCase() === ciudad?.toLowerCase()
         ) || comunas[0]; // Fallback: primera comuna
-        
+
         const codComuna = comuna ? (comuna.cod_comuna || comuna.code_ext || comuna.code || '.') : '.';
         const codCiudad = mapRegionToCode(region);
-        
+
         // RUT del cliente
         let rutCliente = rutAttr?.value || billingAddress.company || customer.default_address?.company || '11111111-1';
         if (!rutCliente.includes('-')) {
@@ -321,25 +365,25 @@ async function createClient(orderData) {
             const rutBase = rutCliente.replace(/\D/g, '');
             rutCliente = formatRut(rutBase) || rutCliente;
         }
-        
+
         // Razón social
-        const razonSocial = razonSocialAttr?.value || 
-                           billingAddress.name?.toUpperCase() || 
-                           customer.default_address?.name?.toUpperCase() || 
-                           'Cliente Shopify';
-        
+        const razonSocial = razonSocialAttr?.value ||
+            billingAddress.name?.toUpperCase() ||
+            customer.default_address?.name?.toUpperCase() ||
+            'Cliente Shopify';
+
         // Email
         const email = emailAttr?.value || customer.email || orderData.email || '';
-        
+
         // Teléfono
-        const telefono = telefonoAttr?.value || 
-                        billingAddress.phone || 
-                        shippingAddress.phone || 
-                        customer.default_address?.phone || '';
-        
+        const telefono = telefonoAttr?.value ||
+            billingAddress.phone ||
+            shippingAddress.phone ||
+            customer.default_address?.phone || '';
+
         // Giro
         const giro = giroAttr?.value || (isFactura ? 'Comercio' : 'Persona Natural');
-        
+
         // Verificar si el cliente ya existe
         const clienteExiste = await checkClientExists(rutCliente);
         if (clienteExiste) {
@@ -351,7 +395,7 @@ async function createClient(orderData) {
                 existing: true
             };
         }
-        
+
         // Preparar datos del cliente
         const infoCliente = {
             rut_empresa: RUT_EMPRESA,
@@ -391,31 +435,34 @@ async function createClient(orderData) {
             caract1: "",
             caract2: ""
         };
-        
+
         // Crear cliente en Manager+
-        const response = await axios.post(
-            `${ERP_BASE_URL}/import/create-client/?sobreescribir=S`,
-            infoCliente,
-            {
-                headers: {
-                    'Authorization': `Token ${token}`,
-                    'Content-Type': 'application/json'
+        const response = await axiosWithRetry(
+            () => axios.post(
+                `${ERP_BASE_URL}/import/create-client/?sobreescribir=S`,
+                infoCliente,
+                {
+                    headers: {
+                        'Authorization': `Token ${token}`,
+                        'Content-Type': 'application/json'
+                    }
                 }
-            }
+            ),
+            `Crear cliente ${rutCliente}`
         );
-        
+
         console.log(`   └─ Cliente ${rutCliente} creado exitosamente en Manager+`);
-        
+
         return {
             cliente: { rut_cliente: rutCliente },
             direccionNombre: 'Direccion Shopify',
             created: true,
             data: response.data
         };
-        
+
     } catch (error) {
-        const errorMsg = error.response?.data?.mensaje || error.response?.data?.message || error.message;
-        console.error(`   └─ Error al crear cliente: ${errorMsg}`);
+        const errorMsg = serializeError(error.response?.data || error);
+        console.error(`[${getTimestamp()}]    └─ Error al crear cliente: ${errorMsg}`);
         throw error;
     }
 }
@@ -430,25 +477,25 @@ async function getFolio() {
         const fechaHoy = new Date();
         const fechaTomorrow = format(addDays(fechaHoy, 1), "yyyyMMdd");
         const fechaAnterior = format(subDays(fechaHoy, 3), "yyyyMMdd");
-        
+
         const endpoint = `documents/${RUT_EMPRESA}/NV/V/?df=${fechaAnterior}&dt=${fechaTomorrow}`;
-        
+
         const response = await axios.get(`${ERP_BASE_URL}/${endpoint}`, {
             headers: {
                 'Authorization': `Token ${token}`,
                 'Content-Type': 'application/json'
             }
         });
-        
+
         const documentos = response.data.data || [];
-        
+
         let maxFolio = -Infinity;
         documentos.forEach((documento) => {
             if (documento.folio > maxFolio) {
                 maxFolio = documento.folio;
             }
         });
-        
+
         return maxFolio === -Infinity ? 0 : maxFolio;
     } catch (error) {
         console.error('Error al obtener folio:', error.message);
@@ -473,7 +520,7 @@ async function validateProductUnit(sku) {
                 }
             }
         );
-        
+
         const unidad = response.data.data[0]?.unidadstock || 'UMS';
         return unidad;
     } catch (error) {
@@ -502,20 +549,20 @@ async function createOrder(orderData, clienteInfo) {
 
     try {
         const token = await getERPAuthToken();
-        
+
         // Crear cliente primero
         await createClient(orderData);
-        
+
         // Obtener folio
         const maxFolio = await getFolio();
-        
+
         // Preparar detalles de la orden
         const detalles = [];
-        
+
         // Procesar items de la orden
         for (const item of orderData.line_items || []) {
             const unidad = await validateProductUnit(item.sku);
-            
+
             const detalle = {
                 cod_producto: item.sku,
                 cantidad: item.quantity.toString(),
@@ -545,10 +592,10 @@ async function createOrder(orderData, clienteInfo) {
                 fecha_comp: "",
                 porc_retencion: ""
             };
-            
+
             detalles.push(detalle);
         }
-        
+
         // Agregar costo de envío si existe
         if (orderData.shipping_lines && orderData.shipping_lines.length > 0 && orderData.shipping_lines[0].price > 0) {
             const shipping = orderData.shipping_lines[0];
@@ -583,29 +630,29 @@ async function createOrder(orderData, clienteInfo) {
             };
             detalles.push(despacho);
         }
-        
+
         // Obtener datos adicionales
         const noteAttributes = orderData.note_attributes || [];
-        const nombreAttr = noteAttributes.find(attr => attr.name === 'Nombre') || 
-                          noteAttributes.find(attr => attr.name === 'Nombre de quien realiza el pedido');
-        const apellidoAttr = noteAttributes.find(attr => attr.name === 'Apellido') || 
-                            noteAttributes.find(attr => attr.name === 'Apellido de quien realiza el pedido');
+        const nombreAttr = noteAttributes.find(attr => attr.name === 'Nombre') ||
+            noteAttributes.find(attr => attr.name === 'Nombre de quien realiza el pedido');
+        const apellidoAttr = noteAttributes.find(attr => attr.name === 'Apellido') ||
+            noteAttributes.find(attr => attr.name === 'Apellido de quien realiza el pedido');
         const telefonoAttr = noteAttributes.find(attr => attr.name === 'Recibe-Teléfono');
-        
+
         const nombre = nombreAttr?.value || '';
         const apellido = apellidoAttr?.value || '';
         const telefono = telefonoAttr?.value || orderData.billing_address?.phone || '';
         const notes = orderData.note || '';
-        
+
         // Fecha actual
         const fechaHoy = format(new Date(), "dd/MM/yyyy");
-        
+
         // Calcular totales
         const totalPrice = parseFloat(orderData.total_price || 0);
         const totalDiscounts = parseFloat(orderData.total_discounts || 0);
         const afecto = Math.round((totalPrice - totalDiscounts) / 1.19);
         const iva = Math.round(afecto * 0.19);
-        
+
         // Preparar glosa
         const glosaParts = [
             'Shopify',
@@ -615,7 +662,7 @@ async function createOrder(orderData, clienteInfo) {
             `Referencia: ${orderData.checkout_id || orderData.order_number || ''}`
         ].filter(Boolean);
         const glosa = glosaParts.join('; ').slice(0, 100);
-        
+
         // Preparar información de la orden
         const infoOrder = {
             rut_empresa: RUT_EMPRESA,
@@ -649,31 +696,33 @@ async function createOrder(orderData, clienteInfo) {
             ajuste_iva: "0",
             detalles: detalles
         };
-        
+
         // Crear orden en Manager+
-        const response = await axios.post(
-            `${ERP_BASE_URL}/import/create-document/?emitir=N&docnumreg=N`,
-            infoOrder,
-            {
-                headers: {
-                    'Authorization': `Token ${token}`,
-                    'Content-Type': 'application/json'
+        const response = await axiosWithRetry(
+            () => axios.post(
+                `${ERP_BASE_URL}/import/create-document/?emitir=N&docnumreg=N`,
+                infoOrder,
+                {
+                    headers: {
+                        'Authorization': `Token ${token}`,
+                        'Content-Type': 'application/json'
+                    }
                 }
-            }
+            ),
+            `Crear orden ${infoOrder.num_doc}`
         );
-        
+
         console.log(`   └─ Orden ${infoOrder.num_doc} creada exitosamente en Manager+`);
-        
+
         return {
             success: true,
             data: response.data,
             orden: infoOrder
         };
-        
+
     } catch (error) {
-        const errorDetails = error.response?.data || {};
-        const errorMsg = errorDetails.mensaje || errorDetails.message || error.message;
-        console.error(`   └─ Error al crear orden: ${errorMsg}`);
+        const errorMsg = serializeError(error.response?.data || error);
+        console.error(`[${getTimestamp()}]    └─ Error al crear orden: ${errorMsg}`);
         throw error;
     }
 }
@@ -687,15 +736,15 @@ async function createOrder(orderData, clienteInfo) {
 async function processOrderNotification(orderData) {
     // Almacenar el último webhook recibido
     lastWebhookNotification = JSON.parse(JSON.stringify(orderData));
-    
+
     // Extraer ID de orden
     const orderId = orderData.id?.toString() || orderData.order_id?.toString() || '';
-    
+
     if (!orderId) {
         console.error('[ERROR] No se encontró ID de orden en la notificación de Shopify');
         return { success: false, error: 'ID de orden no encontrado' };
     }
-    
+
     // Idempotencia: evitar reprocesar la misma orden múltiples veces
     if (processedOrders.has(orderId)) {
         console.log(`[SKIP] Orden Shopify ${orderId}: Ya procesada anteriormente`);
@@ -707,15 +756,15 @@ async function processOrderNotification(orderData) {
         };
     }
     processedOrders.add(orderId);
-    
+
     console.log(`[PROCESO] Orden Shopify ${orderId}: Iniciando procesamiento...`);
-    
+
     // Validaciones previas
     if (!ERP_BASE_URL || !ERP_USERNAME || !ERP_PASSWORD || !RUT_EMPRESA) {
         console.error(`[ERROR] Orden ${orderId}: Variables de entorno del ERP incompletas`);
         return { success: false, error: 'Configuración incompleta: Variables del ERP no definidas' };
     }
-    
+
     // Verificar si la creación está habilitada
     if (!ENABLE_SHOPIFY_CREATE) {
         console.log(`[TESTING] Orden ${orderId}: Creación DESACTIVADA - Solo recibiendo webhook`);
@@ -728,42 +777,42 @@ async function processOrderNotification(orderData) {
             orderData: orderData
         };
     }
-    
+
     try {
         // Obtener información completa de la orden desde Shopify (si no está completa en el webhook)
         let orderDataComplete = orderData;
         if (!orderData.line_items || orderData.line_items.length === 0) {
             orderDataComplete = await getShopifyOrder(orderId);
         }
-        
+
         // Validar que tenemos datos básicos de la orden
         if (!orderDataComplete || !orderDataComplete.customer) {
             console.error(`[ERROR] Orden ${orderId}: Datos de orden incompletos`);
             return { success: false, error: 'Datos de orden incompletos desde Shopify' };
         }
-        
+
         // Crear cliente
         console.log(`   └─ Creando cliente...`);
         const clienteInfo = await createClient(orderDataComplete);
-        
+
         // Crear orden
         console.log(`   └─ Creando orden...`);
         const ordenResult = await createOrder(orderDataComplete, clienteInfo);
-        
+
         console.log(`[RESUMEN] Orden Shopify ${orderId}: ✅ COMPLETADA - Cliente y Orden creados exitosamente\n`);
-        
+
         return {
             success: true,
             orderId,
             cliente: clienteInfo,
             orden: ordenResult
         };
-        
+
     } catch (error) {
-        const errorMsg = error.response?.data?.message || error.response?.data?.mensaje || error.message;
-        console.error(`[ERROR] Orden Shopify ${orderId}: ${errorMsg}`);
+        const errorMsg = serializeError(error.response?.data || error);
+        console.error(`[${getTimestamp()}] [ERROR] Orden Shopify ${orderId}: ${errorMsg}`);
         console.log(''); // Línea en blanco para separar
-        
+
         return {
             success: false,
             error: errorMsg,
@@ -799,16 +848,16 @@ async function reprocessLastWebhook(force = false) {
             error: 'No hay webhook almacenado para reprocesar'
         };
     }
-    
-    const orderId = lastWebhookNotification.id?.toString() || 
-                   lastWebhookNotification.order_id?.toString() || 
-                   'N/A';
-    
+
+    const orderId = lastWebhookNotification.id?.toString() ||
+        lastWebhookNotification.order_id?.toString() ||
+        'N/A';
+
     if (force) {
         // Remover de processedOrders para permitir reprocesamiento
         processedOrders.delete(orderId);
     }
-    
+
     return await processOrderNotification(lastWebhookNotification);
 }
 
