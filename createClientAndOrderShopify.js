@@ -37,18 +37,36 @@ async function axiosWithRetry(requestFn, operationName = 'petición') {
         } catch (error) {
             lastError = error;
             const status = error.response?.status;
-            const isRetryable = RETRY_CONFIG.retryableStatuses.includes(status);
+            const responseData = error.response?.data;
+
+            // Detectar rate limit de múltiples formas
+            const isRateLimitStatus = RETRY_CONFIG.retryableStatuses.includes(status);
+            const hasRetryField = responseData?.retry !== undefined;
+            const hasLimitMessage = responseData?.detail?.includes('límite') ||
+                responseData?.message?.includes('límite');
+
+            const isRetryable = isRateLimitStatus || hasRetryField || hasLimitMessage;
 
             if (!isRetryable || attempt === RETRY_CONFIG.maxRetries) {
-                throw error;
+                // Marcar el error para que la cola sepa que es rate limit
+                if (isRetryable) {
+                    lastError.isRateLimit = true;
+                }
+                throw lastError;
             }
 
-            const delayMs = Math.min(
+            // Usar el tiempo de retry sugerido por el ERP si existe
+            let delayMs = Math.min(
                 RETRY_CONFIG.baseDelay * Math.pow(2, attempt - 1),
                 RETRY_CONFIG.maxDelay
             );
 
-            console.log(`[${getTimestamp()}] ⏳ ${operationName}: Error ${status}, reintento ${attempt}/${RETRY_CONFIG.maxRetries} en ${delayMs / 1000}s...`);
+            // Si el ERP nos dice cuánto esperar, usar ese valor + 2 segundos de margen
+            if (responseData?.retry) {
+                delayMs = Math.max(delayMs, (responseData.retry + 2) * 1000);
+            }
+
+            console.log(`[${getTimestamp()}] ⏳ ${operationName}: Error ${status || 'rate-limit'}, reintento ${attempt}/${RETRY_CONFIG.maxRetries} en ${delayMs / 1000}s...`);
             await delay(delayMs);
         }
     }
