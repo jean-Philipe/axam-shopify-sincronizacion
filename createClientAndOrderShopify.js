@@ -210,15 +210,185 @@ async function getShopifyOrder(orderId) {
 async function getComunas() {
     try {
         const token = await getERPAuthToken();
-        const response = await axios.get(`${ERP_BASE_URL}/tabla-gral/comunas`, {
-            headers: {
-                'Authorization': `Token ${token}`,
-                'Content-Type': 'application/json'
-            }
-        });
+        const response = await axiosWithRetry(
+            () => axios.get(`${ERP_BASE_URL}/tabla-gral/comunas`, {
+                headers: {
+                    'Authorization': `Token ${token}`,
+                    'Content-Type': 'application/json'
+                }
+            }),
+            'Obtener comunas'
+        );
         return response.data.data || [];
     } catch (error) {
+        console.error(`[${getTimestamp()}] Error al obtener comunas:`, serializeError(error));
         return [];
+    }
+}
+
+/**
+ * Obtener ciudades desde Manager+
+ */
+async function getCiudades() {
+    try {
+        const token = await getERPAuthToken();
+        const response = await axiosWithRetry(
+            () => axios.get(`${ERP_BASE_URL}/tabla-gral/ciudades`, {
+                headers: {
+                    'Authorization': `Token ${token}`,
+                    'Content-Type': 'application/json'
+                }
+            }),
+            'Obtener ciudades'
+        );
+        return response.data.data || [];
+    } catch (error) {
+        console.error(`[${getTimestamp()}] Error al obtener ciudades:`, serializeError(error));
+        return [];
+    }
+}
+
+/**
+ * Obtener valores por defecto seguros de comuna y ciudad que siempre funcionen
+ * Estos valores son conocidos y válidos en el ERP
+ * IMPORTANTE: La comuna y ciudad DEBEN pertenecer a la misma región
+ */
+async function getValoresSegurosPorDefecto(regionTarget = null) {
+    try {
+        const comunas = await getComunas();
+        const ciudades = await getCiudades();
+
+        // Función auxiliar para obtener el código de región de forma consistente
+        const getRegion = (item) => {
+            if (!item) return null;
+            return item.cod_region || item.region_code || item.region || null;
+        };
+
+        // Si se especificó una región, buscar ahí primero
+        const regionesPrioritarias = regionTarget
+            ? [regionTarget, "13", "RM", "5", "VS", "8", "BI"]
+            : ["13", "RM", "5", "VS", "8", "BI"];
+
+        for (const targetReg of regionesPrioritarias) {
+            // Buscar una comuna de esta región que tenga cod_ciudad válido
+            const comunaConCiudad = comunas?.find(c => {
+                const regionC = getRegion(c);
+                const ciudadValida = c.cod_ciudad && c.cod_ciudad !== ".";
+                const regionMatch = regionC === targetReg ||
+                    (targetReg === "13" && regionC === "RM") ||
+                    (targetReg === "RM" && regionC === "13") ||
+                    (targetReg === "5" && regionC === "VS") ||
+                    (targetReg === "VS" && regionC === "5") ||
+                    (targetReg === "8" && regionC === "BI") ||
+                    (targetReg === "BI" && regionC === "8");
+                return ciudadValida && regionMatch;
+            });
+
+            if (comunaConCiudad) {
+                const codComuna = comunaConCiudad.cod_comuna || comunaConCiudad.code_ext || comunaConCiudad.code;
+                const codCiudad = comunaConCiudad.cod_ciudad;
+
+                // Verificar que la ciudad exista
+                const ciudadVerificada = ciudades?.find(ciudad => {
+                    const codC = ciudad.cod_ciudad || ciudad.code;
+                    return codC === codCiudad;
+                });
+
+                if (ciudadVerificada) {
+                    return { codComuna, codCiudad };
+                }
+
+                // Si la ciudad no está verificada, buscar otra de la misma región
+                const regionComuna = getRegion(comunaConCiudad);
+                const ciudadMismaRegion = ciudades?.find(c => {
+                    const regionC = getRegion(c);
+                    const codigoValido = (c.cod_ciudad && c.cod_ciudad !== ".") || (c.code && c.code !== ".");
+                    return codigoValido && regionC === regionComuna;
+                });
+
+                if (ciudadMismaRegion) {
+                    return {
+                        codComuna,
+                        codCiudad: ciudadMismaRegion.cod_ciudad || ciudadMismaRegion.code
+                    };
+                }
+            }
+        }
+
+        // Último recurso: usar códigos conocidos de Santiago
+        console.log(`[${getTimestamp()}]    └─ [WARN] No se encontró combinación válida, usando Santiago`);
+        return { codComuna: "13101", codCiudad: "13" };
+
+    } catch (error) {
+        console.log(`[${getTimestamp()}]    └─ [WARN] Error obteniendo valores seguros: ${serializeError(error)}`);
+        return { codComuna: "13101", codCiudad: "13" };
+    }
+}
+
+/**
+ * Buscar comuna por nombre en Manager+ con búsqueda flexible
+ * @param {string} comunaName - Nombre de la comuna a buscar
+ * @param {string} regionCode - Código de región para filtrar
+ * @returns {Promise<Object>} Objeto con codComuna y codCiudad válidos
+ */
+async function buscarComunaConCiudad(comunaName, regionCode) {
+    try {
+        const comunas = await getComunas();
+        const ciudades = await getCiudades();
+
+        if (!comunaName) {
+            return await getValoresSegurosPorDefecto(regionCode);
+        }
+
+        const normalizedSearch = comunaName.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+        // Función para normalizar nombre
+        const normalize = (str) => (str || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+        // Buscar comuna por nombre
+        let found = comunas.find(c => normalize(c.name) === normalizedSearch);
+
+        // Búsqueda parcial si no hay exacta
+        if (!found) {
+            found = comunas.find(c => {
+                const normalizedName = normalize(c.name);
+                return normalizedName.includes(normalizedSearch) || normalizedSearch.includes(normalizedName);
+            });
+        }
+
+        if (found) {
+            const codComuna = found.cod_comuna || found.code_ext || found.code;
+            const codCiudadFromComuna = found.cod_ciudad;
+
+            // Verificar que cod_ciudad sea válido
+            if (codCiudadFromComuna && codCiudadFromComuna !== ".") {
+                console.log(`[${getTimestamp()}]    └─ ✓ Comuna encontrada: "${found.name}" (${codComuna}), ciudad: ${codCiudadFromComuna}`);
+                return { codComuna, codCiudad: codCiudadFromComuna };
+            }
+
+            // Si la comuna no tiene ciudad válida, buscar una ciudad de la misma región
+            const regionComuna = found.cod_region || found.region_code || found.region;
+            if (regionComuna) {
+                const ciudadMismaRegion = ciudades?.find(c => {
+                    const regionC = c.cod_region || c.region_code || c.region;
+                    return regionC === regionComuna && (c.cod_ciudad || c.code) && (c.cod_ciudad || c.code) !== ".";
+                });
+
+                if (ciudadMismaRegion) {
+                    const codCiudad = ciudadMismaRegion.cod_ciudad || ciudadMismaRegion.code;
+                    console.log(`[${getTimestamp()}]    └─ ✓ Comuna "${found.name}" (${codComuna}), ciudad de región: ${codCiudad}`);
+                    return { codComuna, codCiudad };
+                }
+            }
+        }
+
+        // No encontrada, usar valores seguros para la región
+        console.log(`[${getTimestamp()}]    └─ ⚠️ Comuna "${comunaName}" no encontrada. Buscando valor seguro...`);
+        return await getValoresSegurosPorDefecto(regionCode);
+
+    } catch (error) {
+        console.error(`[${getTimestamp()}] Error buscando comuna:`, serializeError(error));
+        return await getValoresSegurosPorDefecto(regionCode);
     }
 }
 
@@ -326,7 +496,6 @@ async function createClient(orderData) {
 
     try {
         const token = await getERPAuthToken();
-        const comunas = await getComunas();
 
         // Extraer datos del cliente desde la orden de Shopify
         const billingAddress = orderData.billing_address || {};
@@ -367,20 +536,11 @@ async function createClient(orderData) {
         const region = regionAttr?.value || shippingAddress.province || billingAddress.province || '';
         const comunaName = comunaAttr?.value || ciudad;
 
-        // Buscar comuna en la lista
-        const comuna = comunas.find(c =>
-            c.name?.toLowerCase() === comunaName?.toLowerCase() ||
-            c.name?.toLowerCase() === ciudad?.toLowerCase()
-        );
+        // Obtener código de región
+        const regionCode = mapRegionToCode(region);
 
-        // Log para debug de comuna
-        if (!comuna) {
-            console.log(`[${getTimestamp()}]    └─ ⚠️ Comuna "${comunaName}" no encontrada en Manager+. Usando default.`);
-        }
-
-        // Usar código de comuna encontrado o default a Santiago (13101)
-        const codComuna = comuna ? (comuna.cod_comuna || comuna.code_ext || comuna.code || '13101') : '13101';
-        const codCiudad = mapRegionToCode(region);
+        // Buscar comuna con ciudad válida usando la función probada
+        const { codComuna, codCiudad } = await buscarComunaConCiudad(comunaName, regionCode);
 
         // RUT del cliente
         let rutCliente = rutAttr?.value || billingAddress.company || customer.default_address?.company || '11111111-1';
