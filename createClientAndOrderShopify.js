@@ -371,9 +371,15 @@ async function createClient(orderData) {
         const comuna = comunas.find(c =>
             c.name?.toLowerCase() === comunaName?.toLowerCase() ||
             c.name?.toLowerCase() === ciudad?.toLowerCase()
-        ) || comunas[0]; // Fallback: primera comuna
+        );
 
-        const codComuna = comuna ? (comuna.cod_comuna || comuna.code_ext || comuna.code || '.') : '.';
+        // Log para debug de comuna
+        if (!comuna) {
+            console.log(`[${getTimestamp()}]    └─ ⚠️ Comuna "${comunaName}" no encontrada en Manager+. Usando default.`);
+        }
+
+        // Usar código de comuna encontrado o default a Santiago (13101)
+        const codComuna = comuna ? (comuna.cod_comuna || comuna.code_ext || comuna.code || '13101') : '13101';
         const codCiudad = mapRegionToCode(region);
 
         // RUT del cliente
