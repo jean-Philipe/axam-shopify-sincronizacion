@@ -478,6 +478,157 @@ async function checkClientExists(rutCliente) {
 }
 
 /**
+ * Obtener las direcciones de un cliente desde Manager+
+ * 
+ * @param {string} rutCliente - RUT del cliente
+ * @returns {Promise<Array|null>} Lista de direcciones o null si no se encuentran
+ */
+async function getClientDirecciones(rutCliente) {
+    try {
+        const token = await getERPAuthToken();
+
+        // Intentar diferentes endpoints para obtener direcciones
+        const endpoints = [
+            `${ERP_BASE_URL}/clients/${RUT_EMPRESA}/${rutCliente}/addresses/`,
+            `${ERP_BASE_URL}/clients/${RUT_EMPRESA}/${rutCliente}/direcciones/`,
+            `${ERP_BASE_URL}/clients/${RUT_EMPRESA}/${rutCliente}/`
+        ];
+
+        for (const endpoint of endpoints) {
+            try {
+                const response = await axios.get(endpoint, {
+                    headers: {
+                        'Authorization': `Token ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    validateStatus: (status) => status < 500
+                });
+
+                if (response.status === 200 && response.data) {
+                    const data = response.data?.data || response.data;
+
+                    // Si es un cliente con direcciones
+                    if (data?.direcciones && Array.isArray(data.direcciones)) {
+                        return data.direcciones;
+                    }
+
+                    // Si es un array de direcciones directamente
+                    if (Array.isArray(data) && data.length > 0 && (data[0].direccion || data[0].descrip_dir)) {
+                        return data;
+                    }
+
+                    // Si el cliente tiene descrip_dir directamente
+                    if (data?.descrip_dir) {
+                        return [{ descrip_dir: data.descrip_dir, direccion: data.direccion }];
+                    }
+                }
+            } catch (e) {
+                // Continuar con el siguiente endpoint
+            }
+        }
+
+        return null;
+    } catch (error) {
+        return null;
+    }
+}
+
+/**
+ * Crear o actualizar la dirección de un cliente en Manager+
+ * Esta función es crucial para clientes que ya existen pero no tienen dirección registrada
+ * 
+ * @param {string} token - Token de autenticación del ERP
+ * @param {string} rutCliente - RUT del cliente
+ * @param {string} direccion - Dirección física
+ * @param {string} codComuna - Código de comuna
+ * @param {string} codCiudad - Código de ciudad
+ * @param {string} telefono - Teléfono de contacto
+ * @param {string} email - Email de contacto
+ * @returns {Promise<Object>} Resultado con el nombre de la dirección utilizada
+ */
+async function createOrUpdateClientAddress(token, rutCliente, direccion, codComuna, codCiudad, telefono, email) {
+    const direccionNombre = 'Direccion Shopify';
+
+    try {
+        // Intentar crear/actualizar la dirección usando el endpoint principal
+        const direccionData = {
+            rut_empresa: RUT_EMPRESA,
+            rut_cliente: rutCliente,
+            descrip_dir: direccionNombre,
+            direccion: direccion || 'SIN DIRECCION',
+            cod_comuna: codComuna,
+            cod_ciudad: codCiudad,
+            atencion: ".",
+            telefono: telefono || ".",
+            fax: "",
+            email: email?.slice(0, 50) || ""
+        };
+
+        await axiosWithRetry(
+            () => axios.post(
+                `${ERP_BASE_URL}/import/create-client-address/?sobreescribir=S`,
+                direccionData,
+                {
+                    headers: {
+                        'Authorization': `Token ${token}`,
+                        'Content-Type': 'application/json'
+                    }
+                }
+            ),
+            `Crear dirección para ${rutCliente}`
+        );
+        console.log(`[${getTimestamp()}]    └─ [DIR] Dirección del cliente creada/actualizada: "${direccionNombre}"`);
+        return { success: true, direccionNombre };
+
+    } catch (dirError) {
+        // Si falla el endpoint principal, intentar con endpoint alternativo
+        try {
+            const direccionAlt = {
+                rut_empresa: RUT_EMPRESA,
+                rut_cliente: rutCliente,
+                tipo_direccion: "1", // 1 = Principal
+                descripcion: direccionNombre,
+                direccion: direccion || 'SIN DIRECCION',
+                cod_comuna: codComuna,
+                cod_ciudad: codCiudad,
+                contacto: ".",
+                telefono: telefono || ".",
+                email: email?.slice(0, 50) || ""
+            };
+
+            await axios.post(
+                `${ERP_BASE_URL}/clients/${RUT_EMPRESA}/${rutCliente}/addresses/`,
+                direccionAlt,
+                {
+                    headers: {
+                        'Authorization': `Token ${token}`,
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+            console.log(`[${getTimestamp()}]    └─ [DIR] Dirección creada con endpoint alternativo: "${direccionNombre}"`);
+            return { success: true, direccionNombre };
+
+        } catch (altError) {
+            // Si ambos endpoints fallan, intentar obtener una dirección existente del cliente
+            const direccionesExistentes = await getClientDirecciones(rutCliente);
+            if (direccionesExistentes && direccionesExistentes.length > 0) {
+                const nombreExistente = direccionesExistentes[0].descrip_dir ||
+                    direccionesExistentes[0].descripcion ||
+                    direccionesExistentes[0].nombre ||
+                    direccionNombre;
+                console.log(`[${getTimestamp()}]    └─ [DIR] Usando dirección existente: "${nombreExistente}"`);
+                return { success: true, direccionNombre: nombreExistente };
+            }
+
+            const altMsg = altError.response?.data?.mensaje || altError.message;
+            console.log(`[${getTimestamp()}]    └─ [DIR] No se pudo crear dirección: ${typeof altMsg === 'object' ? serializeError(altMsg) : altMsg}`);
+            return { success: false, direccionNombre, error: altMsg };
+        }
+    }
+}
+
+/**
  * Crear cliente en Manager+ desde datos de orden de Shopify
  * 
  * @param {Object} orderData - Datos completos de la orden de Shopify
@@ -572,9 +723,22 @@ async function createClient(orderData) {
         const clienteExiste = await checkClientExists(rutCliente);
         if (clienteExiste) {
             console.log(`   └─ Cliente ${rutCliente} ya existe en Manager+`);
+
+            // Aunque el cliente exista, debemos asegurar que tenga una dirección válida
+            // Intentar crear/actualizar la dirección del cliente
+            const direccionResult = await createOrUpdateClientAddress(
+                token,
+                rutCliente,
+                direccion.slice(0, 70),
+                codComuna,
+                codCiudad,
+                telefono,
+                email
+            );
+
             return {
                 cliente: { rut_cliente: rutCliente },
-                direccionNombre: 'Direccion Shopify',
+                direccionNombre: direccionResult.direccionNombre || 'Direccion Shopify',
                 created: false,
                 existing: true
             };
@@ -637,9 +801,21 @@ async function createClient(orderData) {
 
         console.log(`   └─ Cliente ${rutCliente} creado exitosamente en Manager+`);
 
+        // Intentar crear/actualizar la dirección del cliente por separado
+        // Esto es necesario porque el endpoint create-client puede no guardar la dirección
+        const direccionResult = await createOrUpdateClientAddress(
+            token,
+            rutCliente,
+            direccion.slice(0, 70),
+            codComuna,
+            codCiudad,
+            telefono,
+            email
+        );
+
         return {
             cliente: { rut_cliente: rutCliente },
-            direccionNombre: 'Direccion Shopify',
+            direccionNombre: direccionResult.direccionNombre || 'Direccion Shopify',
             created: true,
             data: response.data
         };
@@ -858,7 +1034,7 @@ async function createOrder(orderData, clienteInfo) {
             modalidad: "N",
             cod_unidnegocio: "UNEG-001",
             rut_cliente: clienteInfo.cliente.rut_cliente,
-            dire_cliente: "Direccion Shopify",
+            dire_cliente: clienteInfo.direccionNombre || 'Direccion Shopify',
             rut_facturador: "",
             cod_vendedor: ERP_USERNAME,
             cod_comisionista: ERP_USERNAME,
