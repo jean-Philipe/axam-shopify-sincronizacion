@@ -345,6 +345,43 @@ async function buscarComunaConCiudad(comunaName, regionCode) {
         // Función para normalizar nombre
         const normalize = (str) => (str || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
+        /**
+         * Derivar código de ciudad a partir del código de comuna
+         * Códigos de comuna en Chile siguen el formato RRXXX donde RR es la región
+         * Ej: 13107 (Huechuraba) → región 13 → ciudad Santiago (código 13)
+         * Ej: 05602 (Algarrobo) → región 5 → ciudad Valparaíso (código 5)
+         */
+        const derivarCiudadDesdeComuna = (codComuna) => {
+            if (!codComuna) return null;
+
+            const codigo = String(codComuna);
+            let regionNum;
+
+            // El código de comuna tiene formato RRXXX (5 dígitos)
+            // RR = región (01-16), XXX = identificador único
+            if (codigo.length === 5) {
+                regionNum = parseInt(codigo.substring(0, 2), 10);
+            } else if (codigo.length === 4) {
+                // Algunas comunas tienen código de 4 dígitos (ej: 5602 → 5)
+                regionNum = parseInt(codigo.substring(0, 1), 10);
+            } else {
+                return null;
+            }
+
+            // Buscar ciudad que coincida con la región
+            const ciudadMatch = ciudades?.find(c => {
+                const codCiudad = c.code || c.cod_ciudad;
+                return parseInt(codCiudad, 10) === regionNum;
+            });
+
+            if (ciudadMatch) {
+                return ciudadMatch.code || ciudadMatch.cod_ciudad;
+            }
+
+            // Si no hay match exacto, retornar el número de región como string
+            return String(regionNum);
+        };
+
         // Buscar comuna por nombre
         let found = comunas.find(c => normalize(c.name) === normalizedSearch);
 
@@ -358,15 +395,21 @@ async function buscarComunaConCiudad(comunaName, regionCode) {
 
         if (found) {
             const codComuna = found.cod_comuna || found.code_ext || found.code;
-            const codCiudadFromComuna = found.cod_ciudad;
+            let codCiudad = found.cod_ciudad;
 
-            // Verificar que cod_ciudad sea válido
-            if (codCiudadFromComuna && codCiudadFromComuna !== ".") {
-                console.log(`[${getTimestamp()}]    └─ ✓ Comuna encontrada: "${found.name}" (${codComuna}), ciudad: ${codCiudadFromComuna}`);
-                return { codComuna, codCiudad: codCiudadFromComuna };
+            // Si cod_ciudad no está disponible o es inválido, derivarlo del código de comuna
+            if (!codCiudad || codCiudad === ".") {
+                codCiudad = derivarCiudadDesdeComuna(codComuna);
+                if (codCiudad) {
+                    console.log(`[${getTimestamp()}]    └─ ✓ Comuna encontrada: "${found.name}" (${codComuna}), ciudad derivada: ${codCiudad}`);
+                    return { codComuna, codCiudad };
+                }
+            } else {
+                console.log(`[${getTimestamp()}]    └─ ✓ Comuna encontrada: "${found.name}" (${codComuna}), ciudad: ${codCiudad}`);
+                return { codComuna, codCiudad };
             }
 
-            // Si la comuna no tiene ciudad válida, buscar una ciudad de la misma región
+            // Fallback: buscar ciudad de la misma región si la derivación falló
             const regionComuna = found.cod_region || found.region_code || found.region;
             if (regionComuna) {
                 const ciudadMismaRegion = ciudades?.find(c => {
@@ -375,7 +418,7 @@ async function buscarComunaConCiudad(comunaName, regionCode) {
                 });
 
                 if (ciudadMismaRegion) {
-                    const codCiudad = ciudadMismaRegion.cod_ciudad || ciudadMismaRegion.code;
+                    codCiudad = ciudadMismaRegion.cod_ciudad || ciudadMismaRegion.code;
                     console.log(`[${getTimestamp()}]    └─ ✓ Comuna "${found.name}" (${codComuna}), ciudad de región: ${codCiudad}`);
                     return { codComuna, codCiudad };
                 }
@@ -1230,5 +1273,6 @@ module.exports = {
     getLastWebhook,
     clearLastWebhook,
     reprocessLastWebhook,
-    checkClientExists
+    checkClientExists,
+    buscarComunaConCiudad  // Exportar para testing
 };
