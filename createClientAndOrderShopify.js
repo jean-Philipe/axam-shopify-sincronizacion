@@ -587,26 +587,28 @@ async function getClientDirecciones(rutCliente) {
  * @param {string} codCiudad - Código de ciudad
  * @param {string} telefono - Teléfono de contacto
  * @param {string} email - Email de contacto
+ * @param {boolean} forceCreate - Si es true, lanza error si no puede crear la dirección
  * @returns {Promise<Object>} Resultado con el nombre de la dirección utilizada
  */
-async function createOrUpdateClientAddress(token, rutCliente, direccion, codComuna, codCiudad, telefono, email) {
+async function createOrUpdateClientAddress(token, rutCliente, direccion, codComuna, codCiudad, telefono, email, forceCreate = false) {
     const direccionNombre = 'Direccion Shopify';
 
-    try {
-        // Intentar crear/actualizar la dirección usando el endpoint principal
-        const direccionData = {
-            rut_empresa: RUT_EMPRESA,
-            rut_cliente: rutCliente,
-            descrip_dir: direccionNombre,
-            direccion: direccion || 'SIN DIRECCION',
-            cod_comuna: codComuna,
-            cod_ciudad: codCiudad,
-            atencion: ".",
-            telefono: telefono || ".",
-            fax: "",
-            email: email?.slice(0, 50) || ""
-        };
+    // Preparar datos de la dirección
+    const direccionData = {
+        rut_empresa: RUT_EMPRESA,
+        rut_cliente: rutCliente,
+        descrip_dir: direccionNombre,
+        direccion: direccion || 'SIN DIRECCION',
+        cod_comuna: codComuna,
+        cod_ciudad: codCiudad,
+        atencion: ".",
+        telefono: telefono || ".",
+        fax: "",
+        email: email?.slice(0, 50) || ""
+    };
 
+    // Primer intento: endpoint principal de creación de dirección
+    try {
         await axiosWithRetry(
             () => axios.post(
                 `${ERP_BASE_URL}/import/create-client-address/?sobreescribir=S`,
@@ -621,10 +623,13 @@ async function createOrUpdateClientAddress(token, rutCliente, direccion, codComu
             `Crear dirección para ${rutCliente}`
         );
         console.log(`[${getTimestamp()}]    └─ [DIR] Dirección del cliente creada/actualizada: "${direccionNombre}"`);
-        return { success: true, direccionNombre };
+        return { success: true, direccionNombre, created: true };
 
     } catch (dirError) {
-        // Si falla el endpoint principal, intentar con endpoint alternativo
+        const dirErrorMsg = dirError.response?.data?.mensaje || dirError.message;
+        console.log(`[${getTimestamp()}]    └─ [DIR] Primer intento falló: ${typeof dirErrorMsg === 'object' ? serializeError(dirErrorMsg) : dirErrorMsg}`);
+
+        // Segundo intento: endpoint alternativo
         try {
             const direccionAlt = {
                 rut_empresa: RUT_EMPRESA,
@@ -650,21 +655,80 @@ async function createOrUpdateClientAddress(token, rutCliente, direccion, codComu
                 }
             );
             console.log(`[${getTimestamp()}]    └─ [DIR] Dirección creada con endpoint alternativo: "${direccionNombre}"`);
-            return { success: true, direccionNombre };
+            return { success: true, direccionNombre, created: true };
 
         } catch (altError) {
-            // Si ambos endpoints fallan, intentar obtener una dirección existente del cliente
+            const altMsg = altError.response?.data?.mensaje || altError.message;
+            console.log(`[${getTimestamp()}]    └─ [DIR] Segundo intento falló: ${typeof altMsg === 'object' ? serializeError(altMsg) : altMsg}`);
+
+            // Verificar si hay direcciones existentes válidas
             const direccionesExistentes = await getClientDirecciones(rutCliente);
             if (direccionesExistentes && direccionesExistentes.length > 0) {
-                const nombreExistente = direccionesExistentes[0].descrip_dir ||
+                // Verificar que la dirección tenga contenido real
+                const direccionValida = direccionesExistentes.find(dir => {
+                    const nombre = dir.descrip_dir || dir.descripcion || dir.nombre || '';
+                    const contenido = dir.direccion || '';
+                    // Una dirección es válida si tiene un nombre no vacío y contenido real
+                    return nombre.trim() !== '' && contenido.trim() !== '' && contenido !== '.';
+                });
+
+                if (direccionValida) {
+                    const nombreExistente = direccionValida.descrip_dir ||
+                        direccionValida.descripcion ||
+                        direccionValida.nombre ||
+                        direccionNombre;
+                    console.log(`[${getTimestamp()}]    └─ [DIR] Usando dirección existente válida: "${nombreExistente}"`);
+                    return { success: true, direccionNombre: nombreExistente, created: false };
+                }
+
+                // Si hay direcciones pero ninguna es válida, intentar actualizar la primera
+                console.log(`[${getTimestamp()}]    └─ [DIR] Direcciones existentes sin contenido válido, intentando actualizar...`);
+                const nombrePrimera = direccionesExistentes[0].descrip_dir ||
                     direccionesExistentes[0].descripcion ||
-                    direccionesExistentes[0].nombre ||
                     direccionNombre;
-                console.log(`[${getTimestamp()}]    └─ [DIR] Usando dirección existente: "${nombreExistente}"`);
-                return { success: true, direccionNombre: nombreExistente };
+
+                // Tercer intento: actualizar la dirección existente
+                try {
+                    const direccionUpdate = {
+                        ...direccionData,
+                        descrip_dir: nombrePrimera
+                    };
+
+                    await axios.post(
+                        `${ERP_BASE_URL}/import/create-client-address/?sobreescribir=S`,
+                        direccionUpdate,
+                        {
+                            headers: {
+                                'Authorization': `Token ${token}`,
+                                'Content-Type': 'application/json'
+                            }
+                        }
+                    );
+                    console.log(`[${getTimestamp()}]    └─ [DIR] Dirección existente actualizada: "${nombrePrimera}"`);
+                    return { success: true, direccionNombre: nombrePrimera, created: false };
+                } catch (updateError) {
+                    // Si forceCreate está activado, lanzar error
+                    if (forceCreate) {
+                        const error = new Error(`No se pudo crear dirección para cliente ${rutCliente}`);
+                        error.needsAddressCreation = true;
+                        error.response = altError.response;
+                        throw error;
+                    }
+
+                    // Usar el nombre de la primera dirección aunque no sea válida (último recurso)
+                    console.log(`[${getTimestamp()}]    └─ [DIR] ADVERTENCIA: Usando dirección existente potencialmente inválida: "${nombrePrimera}"`);
+                    return { success: false, direccionNombre: nombrePrimera, created: false, warning: 'address_may_be_invalid' };
+                }
             }
 
-            const altMsg = altError.response?.data?.mensaje || altError.message;
+            // No hay direcciones existentes
+            if (forceCreate) {
+                const error = new Error(`No se pudo crear dirección para cliente ${rutCliente}`);
+                error.needsAddressCreation = true;
+                error.response = altError.response;
+                throw error;
+            }
+
             console.log(`[${getTimestamp()}]    └─ [DIR] No se pudo crear dirección: ${typeof altMsg === 'object' ? serializeError(altMsg) : altMsg}`);
             return { success: false, direccionNombre, error: altMsg };
         }
@@ -1125,6 +1189,76 @@ async function createOrder(orderData, clienteInfo) {
 
     } catch (error) {
         const errorMsg = serializeError(error.response?.data || error);
+        const errorStr = JSON.stringify(error.response?.data || {}).toLowerCase();
+
+        // Detectar error de dirección del cliente
+        const isDirClienteError = errorStr.includes('dirección cliente') ||
+            errorStr.includes('direccion cliente') ||
+            errorStr.includes('información de dirección') ||
+            errorStr.includes('informacion de direccion');
+
+        // Si es un error de dirección, intentar forzar la creación de la dirección
+        if (isDirClienteError && !error._addressRetryAttempted) {
+            console.log(`[${getTimestamp()}]    └─ [DIR ERROR] Error de dirección detectado, intentando forzar creación...`);
+
+            try {
+                const token = await getERPAuthToken();
+                const rutCliente = clienteInfo.cliente.rut_cliente;
+
+                // Obtener datos de dirección de la orden
+                const noteAttributes = orderData.note_attributes || [];
+                const direccionAttr = noteAttributes.find(attr => attr.name === 'Dirección de facturación');
+                const regionAttr = noteAttributes.find(attr => attr.name === 'Región');
+                const comunaAttr = noteAttributes.find(attr => attr.name === 'Comuna');
+                const telefonoAttr = noteAttributes.find(attr => attr.name === 'Recibe-Teléfono');
+                const emailAttr = noteAttributes.find(attr => attr.name === 'Email');
+
+                const billingAddress = orderData.billing_address || {};
+                const shippingAddress = orderData.shipping_address || billingAddress;
+                const customer = orderData.customer || {};
+
+                const direccion = direccionAttr?.value ||
+                    (shippingAddress.address1 ? `${shippingAddress.address1}${shippingAddress.address2 ? ', ' + shippingAddress.address2 : ''}` : '') ||
+                    billingAddress.address1 || 'SIN DIRECCION';
+                const region = regionAttr?.value || shippingAddress.province || billingAddress.province || '';
+                const comunaName = comunaAttr?.value || shippingAddress.city || billingAddress.city || '';
+                const telefono = telefonoAttr?.value || billingAddress.phone || shippingAddress.phone || '';
+                const email = emailAttr?.value || customer.email || orderData.email || '';
+
+                // Obtener código de región y buscar comuna/ciudad
+                const regionCode = mapRegionToCode(region);
+                const { codComuna, codCiudad } = await buscarComunaConCiudad(comunaName, regionCode);
+
+                // Forzar creación de dirección
+                const direccionResult = await createOrUpdateClientAddress(
+                    token,
+                    rutCliente,
+                    direccion.slice(0, 70),
+                    codComuna,
+                    codCiudad,
+                    telefono,
+                    email,
+                    true // forceCreate = true
+                );
+
+                console.log(`[${getTimestamp()}]    └─ [DIR] Dirección forzada: "${direccionResult.direccionNombre}"`);
+
+                // Actualizar clienteInfo con el nombre de la nueva dirección
+                clienteInfo.direccionNombre = direccionResult.direccionNombre;
+
+                // Marcar que ya intentamos el retry para evitar loop infinito
+                error._addressRetryAttempted = true;
+
+                // Reintentar crear la orden
+                console.log(`[${getTimestamp()}]    └─ Reintentando creación de orden...`);
+                return await createOrder(orderData, clienteInfo);
+
+            } catch (addressError) {
+                console.error(`[${getTimestamp()}]    └─ [DIR] No se pudo forzar creación de dirección: ${serializeError(addressError)}`);
+                // Continuar con el error original
+            }
+        }
+
         console.error(`[${getTimestamp()}]    └─ Error al crear orden: ${errorMsg}`);
         throw error;
     }
