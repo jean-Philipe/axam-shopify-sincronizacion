@@ -1126,7 +1126,7 @@ async function createOrder(orderData, clienteInfo) {
             nombre && apellido ? `${nombre} ${apellido}` : '',
             telefono ? `Tel: ${telefono}` : '',
             notes ? `Notas: ${notes}` : '',
-            `Referencia: ${orderData.id || ''}`
+            `Referencia: ${orderData.checkout_id || orderData.id || ''}`
         ].filter(Boolean);
         const glosa = glosaParts.join('; ').slice(0, 100);
 
