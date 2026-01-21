@@ -592,6 +592,28 @@ async function getClientDirecciones(rutCliente) {
  */
 async function createOrUpdateClientAddress(token, rutCliente, direccion, codComuna, codCiudad, telefono, email, forceCreate = false) {
     const direccionNombre = 'Direccion Shopify';
+    const normalizedDireccion = (direccion || '').trim().toLowerCase();
+
+    // FIRST: Check if an EQUIVALENT address already exists
+    // Only reuse if it matches the shipping address (same content and comuna)
+    const direccionesExistentes = await getClientDirecciones(rutCliente);
+    if (direccionesExistentes && direccionesExistentes.length > 0) {
+        const direccionEquivalente = direccionesExistentes.find(dir => {
+            const contenido = (dir.direccion || '').trim().toLowerCase();
+            const comunaMatch = dir.cod_comuna === codComuna || !dir.cod_comuna;
+            // Match if address content is similar (contains or is contained)
+            const direccionSimilar = contenido === normalizedDireccion ||
+                contenido.includes(normalizedDireccion) ||
+                normalizedDireccion.includes(contenido);
+            return direccionSimilar && comunaMatch && contenido !== '' && contenido !== '.';
+        });
+
+        if (direccionEquivalente) {
+            const nombreExistente = direccionEquivalente.descrip_dir || direccionEquivalente.descripcion || direccionNombre;
+            console.log(`[${getTimestamp()}]    └─ [DIR] Usando dirección existente equivalente: "${nombreExistente}"`);
+            return { success: true, direccionNombre: nombreExistente, created: false };
+        }
+    }
 
     // Preparar datos de la dirección
     const direccionData = {
