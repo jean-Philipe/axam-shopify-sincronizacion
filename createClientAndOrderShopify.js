@@ -587,10 +587,9 @@ async function getClientDirecciones(rutCliente) {
  * @param {string} codCiudad - Código de ciudad
  * @param {string} telefono - Teléfono de contacto
  * @param {string} email - Email de contacto
- * @param {boolean} forceCreate - Si es true, lanza error si no puede crear la dirección
  * @returns {Promise<Object>} Resultado con el nombre de la dirección utilizada
  */
-async function createOrUpdateClientAddress(token, rutCliente, direccion, codComuna, codCiudad, telefono, email, forceCreate = false) {
+async function createOrUpdateClientAddress(token, rutCliente, direccion, codComuna, codCiudad, telefono, email) {
     const direccionNombre = 'Direccion Shopify';
     const normalizedDireccion = (direccion || '').trim().toLowerCase();
 
@@ -729,28 +728,13 @@ async function createOrUpdateClientAddress(token, rutCliente, direccion, codComu
                     console.log(`[${getTimestamp()}]    └─ [DIR] Dirección existente actualizada: "${nombrePrimera}"`);
                     return { success: true, direccionNombre: nombrePrimera, created: false };
                 } catch (updateError) {
-                    // Si forceCreate está activado, lanzar error
-                    if (forceCreate) {
-                        const error = new Error(`No se pudo crear dirección para cliente ${rutCliente}`);
-                        error.needsAddressCreation = true;
-                        error.response = altError.response;
-                        throw error;
-                    }
-
                     // Usar el nombre de la primera dirección aunque no sea válida (último recurso)
                     console.log(`[${getTimestamp()}]    └─ [DIR] ADVERTENCIA: Usando dirección existente potencialmente inválida: "${nombrePrimera}"`);
                     return { success: false, direccionNombre: nombrePrimera, created: false, warning: 'address_may_be_invalid' };
                 }
             }
 
-            // No hay direcciones existentes
-            if (forceCreate) {
-                const error = new Error(`No se pudo crear dirección para cliente ${rutCliente}`);
-                error.needsAddressCreation = true;
-                error.response = altError.response;
-                throw error;
-            }
-
+            // No hay direcciones existentes - retornar sin error
             console.log(`[${getTimestamp()}]    └─ [DIR] No se pudo crear dirección: ${typeof altMsg === 'object' ? serializeError(altMsg) : altMsg}`);
             return { success: false, direccionNombre, error: altMsg };
         }
@@ -855,19 +839,43 @@ async function createClient(orderData) {
 
             // Aunque el cliente exista, debemos asegurar que tenga una dirección válida
             // Intentar crear/actualizar la dirección del cliente
-            const direccionResult = await createOrUpdateClientAddress(
-                token,
-                rutCliente,
-                direccion.slice(0, 70),
-                codComuna,
-                codCiudad,
-                telefono,
-                email
-            );
+            try {
+                await createOrUpdateClientAddress(
+                    token,
+                    rutCliente,
+                    direccion.slice(0, 70),
+                    codComuna,
+                    codCiudad,
+                    telefono,
+                    email
+                );
+                console.log(`   └─ [DIR] Dirección del cliente actualizada`);
+            } catch (dirError) {
+                // No bloquear si falla - usar dirección existente
+                const dirMsg = dirError.response?.data?.mensaje || dirError.message;
+                console.log(`   └─ [DIR] No se pudo actualizar dirección: ${typeof dirMsg === 'object' ? serializeError(dirMsg) : dirMsg}`);
+            }
+
+            // Obtener direcciones disponibles del cliente
+            let direccionDisponible = "Direccion Shopify";
+            try {
+                const direcciones = await getClientDirecciones(rutCliente);
+                if (direcciones && direcciones.length > 0) {
+                    direccionDisponible = direcciones[0].descrip_dir ||
+                        direcciones[0].descripcion ||
+                        direcciones[0].nombre ||
+                        "Direccion Shopify";
+                    console.log(`   └─ [DIR] Dirección disponible del cliente: "${direccionDisponible}"`);
+                } else {
+                    console.log(`   └─ [DIR] Cliente sin direcciones registradas, usando nombre por defecto`);
+                }
+            } catch (dirError) {
+                console.log(`   └─ [DIR] No se pudieron obtener direcciones del cliente`);
+            }
 
             return {
                 cliente: { rut_cliente: rutCliente },
-                direccionNombre: direccionResult.direccionNombre || 'Direccion Shopify',
+                direccionNombre: direccionDisponible,
                 created: false,
                 existing: true
             };
@@ -932,19 +940,43 @@ async function createClient(orderData) {
 
         // Intentar crear/actualizar la dirección del cliente por separado
         // Esto es necesario porque el endpoint create-client puede no guardar la dirección
-        const direccionResult = await createOrUpdateClientAddress(
-            token,
-            rutCliente,
-            direccion.slice(0, 70),
-            codComuna,
-            codCiudad,
-            telefono,
-            email
-        );
+        try {
+            await createOrUpdateClientAddress(
+                token,
+                rutCliente,
+                direccion.slice(0, 70),
+                codComuna,
+                codCiudad,
+                telefono,
+                email
+            );
+            console.log(`   └─ [DIR] Dirección del cliente creada/actualizada`);
+        } catch (dirError) {
+            // No bloquear si falla - la dirección ya está en create-client
+            const dirMsg = dirError.response?.data?.mensaje || dirError.message;
+            console.log(`   └─ [DIR] No se pudo crear dirección separada: ${typeof dirMsg === 'object' ? serializeError(dirMsg) : dirMsg}`);
+        }
+
+        // Obtener direcciones disponibles del cliente
+        let direccionDisponible = "Direccion Shopify";
+        try {
+            const direcciones = await getClientDirecciones(rutCliente);
+            if (direcciones && direcciones.length > 0) {
+                direccionDisponible = direcciones[0].descrip_dir ||
+                    direcciones[0].descripcion ||
+                    direcciones[0].nombre ||
+                    "Direccion Shopify";
+                console.log(`   └─ [DIR] Dirección disponible del cliente: "${direccionDisponible}"`);
+            } else {
+                console.log(`   └─ [DIR] Cliente sin direcciones registradas, usando nombre por defecto`);
+            }
+        } catch (dirError) {
+            console.log(`   └─ [DIR] No se pudieron obtener direcciones del cliente`);
+        }
 
         return {
             cliente: { rut_cliente: rutCliente },
-            direccionNombre: direccionResult.direccionNombre || 'Direccion Shopify',
+            direccionNombre: direccionDisponible,
             created: true,
             data: response.data
         };
@@ -1211,76 +1243,6 @@ async function createOrder(orderData, clienteInfo) {
 
     } catch (error) {
         const errorMsg = serializeError(error.response?.data || error);
-        const errorStr = JSON.stringify(error.response?.data || {}).toLowerCase();
-
-        // Detectar error de dirección del cliente
-        const isDirClienteError = errorStr.includes('dirección cliente') ||
-            errorStr.includes('direccion cliente') ||
-            errorStr.includes('información de dirección') ||
-            errorStr.includes('informacion de direccion');
-
-        // Si es un error de dirección, intentar forzar la creación de la dirección
-        if (isDirClienteError && !error._addressRetryAttempted) {
-            console.log(`[${getTimestamp()}]    └─ [DIR ERROR] Error de dirección detectado, intentando forzar creación...`);
-
-            try {
-                const token = await getERPAuthToken();
-                const rutCliente = clienteInfo.cliente.rut_cliente;
-
-                // Obtener datos de dirección de la orden
-                const noteAttributes = orderData.note_attributes || [];
-                const direccionAttr = noteAttributes.find(attr => attr.name === 'Dirección de facturación');
-                const regionAttr = noteAttributes.find(attr => attr.name === 'Región');
-                const comunaAttr = noteAttributes.find(attr => attr.name === 'Comuna');
-                const telefonoAttr = noteAttributes.find(attr => attr.name === 'Recibe-Teléfono');
-                const emailAttr = noteAttributes.find(attr => attr.name === 'Email');
-
-                const billingAddress = orderData.billing_address || {};
-                const shippingAddress = orderData.shipping_address || billingAddress;
-                const customer = orderData.customer || {};
-
-                const direccion = direccionAttr?.value ||
-                    (shippingAddress.address1 ? `${shippingAddress.address1}${shippingAddress.address2 ? ', ' + shippingAddress.address2 : ''}` : '') ||
-                    billingAddress.address1 || 'SIN DIRECCION';
-                const region = regionAttr?.value || shippingAddress.province || billingAddress.province || '';
-                const comunaName = comunaAttr?.value || shippingAddress.city || billingAddress.city || '';
-                const telefono = telefonoAttr?.value || billingAddress.phone || shippingAddress.phone || '';
-                const email = emailAttr?.value || customer.email || orderData.email || '';
-
-                // Obtener código de región y buscar comuna/ciudad
-                const regionCode = mapRegionToCode(region);
-                const { codComuna, codCiudad } = await buscarComunaConCiudad(comunaName, regionCode);
-
-                // Forzar creación de dirección
-                const direccionResult = await createOrUpdateClientAddress(
-                    token,
-                    rutCliente,
-                    direccion.slice(0, 70),
-                    codComuna,
-                    codCiudad,
-                    telefono,
-                    email,
-                    true // forceCreate = true
-                );
-
-                console.log(`[${getTimestamp()}]    └─ [DIR] Dirección forzada: "${direccionResult.direccionNombre}"`);
-
-                // Actualizar clienteInfo con el nombre de la nueva dirección
-                clienteInfo.direccionNombre = direccionResult.direccionNombre;
-
-                // Marcar que ya intentamos el retry para evitar loop infinito
-                error._addressRetryAttempted = true;
-
-                // Reintentar crear la orden
-                console.log(`[${getTimestamp()}]    └─ Reintentando creación de orden...`);
-                return await createOrder(orderData, clienteInfo);
-
-            } catch (addressError) {
-                console.error(`[${getTimestamp()}]    └─ [DIR] No se pudo forzar creación de dirección: ${serializeError(addressError)}`);
-                // Continuar con el error original
-            }
-        }
-
         console.error(`[${getTimestamp()}]    └─ Error al crear orden: ${errorMsg}`);
         throw error;
     }
