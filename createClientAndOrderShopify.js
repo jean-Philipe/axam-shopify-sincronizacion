@@ -832,54 +832,10 @@ async function createClient(orderData) {
         // Giro
         const giro = giroAttr?.value || (isFactura ? 'Comercio' : 'Persona Natural');
 
-        // Verificar si el cliente ya existe
-        const clienteExiste = await checkClientExists(rutCliente);
-        if (clienteExiste) {
-            console.log(`   └─ Cliente ${rutCliente} ya existe en Manager+`);
+        // Se eliminó la verificación previa de cliente (checkClientExists) para forzar
+        // siempre el uso del endpoint create-client con sobreescribir=S, lo cual actualiza
+        // correctamente la dirección y evita errores 404 de los endpoints individuales.
 
-            // Aunque el cliente exista, debemos asegurar que tenga una dirección válida
-            // Intentar crear/actualizar la dirección del cliente
-            try {
-                await createOrUpdateClientAddress(
-                    token,
-                    rutCliente,
-                    direccion.slice(0, 70),
-                    codComuna,
-                    codCiudad,
-                    telefono,
-                    email
-                );
-                console.log(`   └─ [DIR] Dirección del cliente actualizada`);
-            } catch (dirError) {
-                // No bloquear si falla - usar dirección existente
-                const dirMsg = dirError.response?.data?.mensaje || dirError.message;
-                console.log(`   └─ [DIR] No se pudo actualizar dirección: ${typeof dirMsg === 'object' ? serializeError(dirMsg) : dirMsg}`);
-            }
-
-            // Obtener direcciones disponibles del cliente
-            let direccionDisponible = "Direccion Shopify";
-            try {
-                const direcciones = await getClientDirecciones(rutCliente);
-                if (direcciones && direcciones.length > 0) {
-                    direccionDisponible = direcciones[0].descrip_dir ||
-                        direcciones[0].descripcion ||
-                        direcciones[0].nombre ||
-                        "Direccion Shopify";
-                    console.log(`   └─ [DIR] Dirección disponible del cliente: "${direccionDisponible}"`);
-                } else {
-                    console.log(`   └─ [DIR] Cliente sin direcciones registradas, usando nombre por defecto`);
-                }
-            } catch (dirError) {
-                console.log(`   └─ [DIR] No se pudieron obtener direcciones del cliente`);
-            }
-
-            return {
-                cliente: { rut_cliente: rutCliente },
-                direccionNombre: direccionDisponible,
-                created: false,
-                existing: true
-            };
-        }
 
         // Preparar datos del cliente
         const infoCliente = {
@@ -936,26 +892,8 @@ async function createClient(orderData) {
             `Crear cliente ${rutCliente}`
         );
 
-        console.log(`   └─ Cliente ${rutCliente} creado exitosamente en Manager+`);
+        console.log(`   └─ Cliente ${rutCliente} procesado exitosamente en Manager+ (Create/Update)`);
 
-        // Intentar crear/actualizar la dirección del cliente por separado
-        // Esto es necesario porque el endpoint create-client puede no guardar la dirección
-        try {
-            await createOrUpdateClientAddress(
-                token,
-                rutCliente,
-                direccion.slice(0, 70),
-                codComuna,
-                codCiudad,
-                telefono,
-                email
-            );
-            console.log(`   └─ [DIR] Dirección del cliente creada/actualizada`);
-        } catch (dirError) {
-            // No bloquear si falla - la dirección ya está en create-client
-            const dirMsg = dirError.response?.data?.mensaje || dirError.message;
-            console.log(`   └─ [DIR] No se pudo crear dirección separada: ${typeof dirMsg === 'object' ? serializeError(dirMsg) : dirMsg}`);
-        }
 
         // Obtener direcciones disponibles del cliente
         let direccionDisponible = "Direccion Shopify";
@@ -1103,7 +1041,7 @@ async function createOrder(orderData, clienteInfo) {
                 concepto2: "",
                 concepto3: "",
                 concepto4: "",
-                descrip: item.title,
+                descrip: item.title.slice(0, 80),
                 desc_adic: "",
                 stock: "0",
                 cod_impesp1: "",
@@ -1178,11 +1116,11 @@ async function createOrder(orderData, clienteInfo) {
         const glosaParts = [
             'Shopify',
             nombre && apellido ? `${nombre} ${apellido}` : '',
-            telefono ? `Tel: ${telefono}` : '',
-            notes ? `Notas: ${notes}` : '',
-            `Referencia: ${orderData.checkout_id || orderData.id || ''}`
+            telefono ? `${telefono}` : '',
+            notes ? `${notes}` : '',
+            `${orderData.checkout_id || orderData.id || ''}`
         ].filter(Boolean);
-        const glosa = glosaParts.join('; ').slice(0, 100);
+        const glosa = glosaParts.join(';').slice(0, 100);
 
         // Preparar información de la orden
         const infoOrder = {
